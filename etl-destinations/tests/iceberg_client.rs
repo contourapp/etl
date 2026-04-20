@@ -201,7 +201,7 @@ async fn create_table_if_missing() {
     // table doesn't exist yet
     assert!(
         !client
-            .table_exists(namespace, table_name.to_string())
+            .table_exists(namespace, table_name.clone())
             .await
             .unwrap()
     );
@@ -215,7 +215,7 @@ async fn create_table_if_missing() {
     // table should exist now
     assert!(
         client
-            .table_exists(namespace, table_name.to_string())
+            .table_exists(namespace, table_name.clone())
             .await
             .unwrap()
     );
@@ -242,7 +242,7 @@ async fn create_table_if_missing() {
     // table should still exist
     assert!(
         client
-            .table_exists(namespace, table_name.to_string())
+            .table_exists(namespace, table_name.clone())
             .await
             .unwrap()
     );
