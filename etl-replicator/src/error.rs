@@ -5,10 +5,7 @@ use std::fmt;
 
 /// Returns whether terminal output should include backtraces.
 fn should_render_backtrace() -> bool {
-    matches!(
-        std::env::var("RUST_BACKTRACE").as_deref(),
-        Ok("1") | Ok("full")
-    )
+    matches!(std::env::var("RUST_BACKTRACE").as_deref(), Ok("1" | "full"))
 }
 
 /// Result type for replicator operations.

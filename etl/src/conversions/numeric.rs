@@ -121,7 +121,7 @@ impl FromStr for PgNumeric {
         };
 
         // Check for special values (NaN, infinity)
-        if !matches!(chars.peek(), Some('0'..='9') | Some('.')) {
+        if !matches!(chars.peek(), Some('0'..='9' | '.')) {
             return parse_special_value(&mut chars, &sign);
         }
 
@@ -345,7 +345,7 @@ fn parse_numeric_value(
     }
 
     // Handle scientific notation
-    if matches!(chars.peek(), Some('e') | Some('E')) {
+    if matches!(chars.peek(), Some('e' | 'E')) {
         chars.next();
         let mut exponent = 0i64;
         let mut exp_negative = false;
