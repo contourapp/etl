@@ -168,7 +168,7 @@ mod tests {
     use etl_config::shared::BatchConfig;
 
     #[test]
-    fn test_stored_pipeline_config_serialization() {
+    fn stored_pipeline_config_serialization() {
         let config = StoredPipelineConfig {
             publication_name: "test_publication".to_string(),
             batch: BatchConfig {
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_pipeline_config_conversion() {
+    fn full_api_pipeline_config_conversion() {
         let full_config = FullApiPipelineConfig {
             publication_name: "test_publication".to_string(),
             batch: None,
@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_pipeline_config_defaults() {
+    fn full_api_pipeline_config_defaults() {
         let full_config = FullApiPipelineConfig {
             publication_name: "test_publication".to_string(),
             batch: None,

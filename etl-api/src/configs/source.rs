@@ -162,7 +162,7 @@ mod tests {
     use crate::configs::encryption::{EncryptionKey, generate_random_key};
 
     #[test]
-    fn test_stored_source_config_encryption_decryption() {
+    fn stored_source_config_encryption_decryption() {
         let config = StoredSourceConfig {
             host: "localhost".to_string(),
             port: 5432,
@@ -195,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_source_config_conversion() {
+    fn full_api_source_config_conversion() {
         let full_config = FullApiSourceConfig {
             host: "localhost".to_string(),
             port: 5432,

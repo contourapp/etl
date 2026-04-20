@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_try_build_all_columns_replicated() {
+    fn replication_mask_try_build_all_columns_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = ["id", "name", "age"]
             .into_iter()
@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_try_build_partial_columns_replicated() {
+    fn replication_mask_try_build_partial_columns_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> =
             ["id", "age"].into_iter().map(String::from).collect();
@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_try_build_no_columns_replicated() {
+    fn replication_mask_try_build_no_columns_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = HashSet::new();
 
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_try_build_unknown_column_error() {
+    fn replication_mask_try_build_unknown_column_error() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = ["id", "unknown_column"]
             .into_iter()
@@ -756,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_try_build_multiple_unknown_columns_error() {
+    fn replication_mask_try_build_multiple_unknown_columns_error() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> =
             ["id", "foo", "bar"].into_iter().map(String::from).collect();
@@ -775,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_build_or_all_success() {
+    fn replication_mask_build_or_all_success() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> =
             ["id", "age"].into_iter().map(String::from).collect();
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_build_or_all_falls_back_to_all() {
+    fn replication_mask_build_or_all_falls_back_to_all() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = ["id", "unknown_column"]
             .into_iter()
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_all() {
+    fn replication_mask_all() {
         let schema = create_test_table_schema();
         let mask = ReplicationMask::all(&schema);
 
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_no_changes() {
+    fn schema_diff_no_changes() {
         let old_schema = create_replicated_schema(vec![
             ColumnSchema::new("id".to_string(), Type::INT4, -1, 1, Some(1), false),
             ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_column_added() {
+    fn schema_diff_column_added() {
         let old_schema = create_replicated_schema(vec![
             ColumnSchema::new("id".to_string(), Type::INT4, -1, 1, Some(1), false),
             ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
@@ -860,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_column_removed() {
+    fn schema_diff_column_removed() {
         let old_schema = create_replicated_schema(vec![
             ColumnSchema::new("id".to_string(), Type::INT4, -1, 1, Some(1), false),
             ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_column_renamed() {
+    fn schema_diff_column_renamed() {
         let old_schema = create_replicated_schema(vec![
             ColumnSchema::new("id".to_string(), Type::INT4, -1, 1, Some(1), false),
             ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_mixed_operations() {
+    fn schema_diff_mixed_operations() {
         // Old schema: id (pos 1), name (pos 2), age (pos 3)
         // New schema: id (pos 1), full_name (pos 2), email (pos 4)
         // Expected: age removed (pos 3), name -> full_name renamed (pos 2), email added (pos 4)
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_multiple_additions() {
+    fn schema_diff_multiple_additions() {
         let old_schema = create_replicated_schema(vec![ColumnSchema::new(
             "id".to_string(),
             Type::INT4,
@@ -968,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_diff_multiple_removals() {
+    fn schema_diff_multiple_removals() {
         let old_schema = create_replicated_schema(vec![
             ColumnSchema::new("id".to_string(), Type::INT4, -1, 1, Some(1), false),
             ColumnSchema::new("name".to_string(), Type::TEXT, -1, 2, None, true),
@@ -998,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_display_all_replicated() {
+    fn replication_mask_display_all_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = ["id", "name", "age"]
             .into_iter()
@@ -1011,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_display_partial_replicated() {
+    fn replication_mask_display_partial_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> =
             ["id", "age"].into_iter().map(String::from).collect();
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_display_none_replicated() {
+    fn replication_mask_display_none_replicated() {
         let schema = create_test_table_schema();
         let replicated_columns: HashSet<String> = HashSet::new();
 
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replication_mask_display_empty() {
+    fn replication_mask_display_empty() {
         let mask = ReplicationMask::from_bytes(vec![]);
 
         assert_eq!(mask.to_string(), "()");

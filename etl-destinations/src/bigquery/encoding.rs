@@ -397,7 +397,7 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn test_bigquery_table_row_try_from_valid() {
+    fn bigquery_table_row_try_from_valid() {
         let table_row = TableRow::new(vec![
             Cell::I32(42),
             Cell::String("test".to_string()),
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_invalid_numeric_nan() {
+    fn bigquery_table_row_try_from_invalid_numeric_nan() {
         let table_row = TableRow::new(vec![Cell::I32(42), Cell::Numeric(PgNumeric::NaN)]);
 
         let result = BigQueryTableRow::try_from(table_row);
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_invalid_numeric_infinity() {
+    fn bigquery_table_row_try_from_invalid_numeric_infinity() {
         let table_row = TableRow::new(vec![
             Cell::String("valid".to_string()),
             Cell::Numeric(PgNumeric::PositiveInfinity),
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_invalid_date() {
+    fn bigquery_table_row_try_from_invalid_date() {
         let invalid_date = NaiveDate::from_ymd_opt(1, 1, 1)
             .unwrap()
             .pred_opt()
@@ -462,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_array_with_nulls() {
+    fn bigquery_table_row_try_from_array_with_nulls() {
         let array_with_nulls = etl::types::ArrayCell::I32(vec![Some(1), None, Some(3)]);
         let table_row = TableRow::new(vec![Cell::Array(array_with_nulls)]);
 
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_array_with_invalid_elements() {
+    fn bigquery_table_row_try_from_array_with_invalid_elements() {
         let array_with_invalid_numeric = etl::types::ArrayCell::Numeric(vec![
             Some(PgNumeric::from_str("123.456").unwrap()),
             Some(PgNumeric::NaN),
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_valid_array() {
+    fn bigquery_table_row_try_from_valid_array() {
         let valid_array = etl::types::ArrayCell::I32(vec![Some(1), Some(2), Some(3)]);
         let table_row = TableRow::new(vec![
             Cell::String("prefix".to_string()),
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_multiple_errors_first_wins() {
+    fn bigquery_table_row_try_from_multiple_errors_first_wins() {
         let table_row = TableRow::new(vec![
             Cell::Numeric(PgNumeric::NaN),              // First invalid cell
             Cell::Numeric(PgNumeric::PositiveInfinity), // Second invalid cell (should not be reached)
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_valid_temporal_values() {
+    fn bigquery_table_row_try_from_valid_temporal_values() {
         let valid_date = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap();
         let valid_time = NaiveTime::from_hms_opt(12, 30, 45).unwrap();
         let valid_datetime = NaiveDateTime::new(valid_date, valid_time);
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bigquery_table_row_try_from_oversized_numeric_fails() {
+    fn bigquery_table_row_try_from_oversized_numeric_fails() {
         // Create a numeric value that exceeds BigQuery's limits
         let oversized_numeric = PgNumeric::from_str(
             "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890"

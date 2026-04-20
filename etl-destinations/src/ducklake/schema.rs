@@ -96,7 +96,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scalar_type_mapping() {
+    fn scalar_type_mapping() {
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::BOOL), "BOOLEAN");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::TEXT), "VARCHAR");
         assert_eq!(
@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_mapping() {
+    fn array_type_mapping() {
         assert_eq!(
             postgres_array_type_to_ducklake_sql(&Type::BOOL_ARRAY),
             "BOOLEAN[]"
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_create_table_sql_quotes_identifiers() {
+    fn build_create_table_sql_quotes_identifiers() {
         let sql = build_create_table_sql_ducklake(
             "odd\"table",
             &[ColumnSchema::new(

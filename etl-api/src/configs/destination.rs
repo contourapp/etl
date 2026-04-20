@@ -748,7 +748,7 @@ mod tests {
     use insta::assert_json_snapshot;
 
     #[test]
-    fn test_stored_destination_config_encryption_decryption_bigquery() {
+    fn stored_destination_config_encryption_decryption_bigquery() {
         let config = StoredDestinationConfig::BigQuery {
             project_id: "test-project".to_string(),
             dataset_id: "test_dataset".to_string(),
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stored_destination_config_encryption_decryption_iceberg_supabase() {
+    fn stored_destination_config_encryption_decryption_iceberg_supabase() {
         let config = StoredDestinationConfig::Iceberg {
             config: StoredIcebergConfig::Supabase {
                 project_ref: "abcdefghijklmnopqrst".to_string(),
@@ -865,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stored_destination_config_encryption_decryption_iceberg_rest() {
+    fn stored_destination_config_encryption_decryption_iceberg_rest() {
         let config = StoredDestinationConfig::Iceberg {
             config: StoredIcebergConfig::Rest {
                 catalog_uri: "https://abcdefghijklmnopqrst.storage.supabase.com/storage/v1/iceberg"
@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_conversion_bigquery() {
+    fn full_api_destination_config_conversion_bigquery() {
         let full_config = FullApiDestinationConfig::BigQuery {
             project_id: "test-project".to_string(),
             dataset_id: "test_dataset".to_string(),
@@ -977,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_conversion_iceberg_supabase() {
+    fn full_api_destination_config_conversion_iceberg_supabase() {
         let full_config = FullApiDestinationConfig::Iceberg {
             config: FullApiIcebergConfig::Supabase {
                 project_ref: "abcdefghijklmnopqrst".to_string(),
@@ -1042,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_conversion_iceberg_rest() {
+    fn full_api_destination_config_conversion_iceberg_rest() {
         let full_config = FullApiDestinationConfig::Iceberg {
             config: FullApiIcebergConfig::Rest {
                 catalog_uri: "https://abcdefghijklmnopqrst.storage.supabase.com/storage/v1/iceberg"
@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stored_destination_config_encryption_decryption_ducklake() {
+    fn stored_destination_config_encryption_decryption_ducklake() {
         let config = StoredDestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_string(),
             data_path: "s3://bucket/path".to_string(),
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_conversion_ducklake() {
+    fn full_api_destination_config_conversion_ducklake() {
         let full_config = FullApiDestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_string(),
             data_path: "file:///absolute/path/to/lake_data".to_string(),
@@ -1217,7 +1217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_serialization_ducklake() {
+    fn full_api_destination_config_serialization_ducklake() {
         let full_config = FullApiDestinationConfig::Ducklake {
             catalog_url: "postgres://user:pass@localhost:5432/ducklake_catalog".to_string(),
             data_path: "s3://bucket/path".to_string(),
@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_serialization_iceberg_supabase() {
+    fn full_api_destination_config_serialization_iceberg_supabase() {
         let full_config = FullApiDestinationConfig::Iceberg {
             config: FullApiIcebergConfig::Supabase {
                 project_ref: "abcdefghijklmnopqrst".to_string(),
@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_api_destination_config_serialization_iceberg_rest() {
+    fn full_api_destination_config_serialization_iceberg_rest() {
         let full_config = FullApiDestinationConfig::Iceberg {
             config: FullApiIcebergConfig::Rest {
                 catalog_uri: "https://catalog.example.com/iceberg".to_string(),

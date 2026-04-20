@@ -59,7 +59,7 @@ fn create_another_table_schema() -> TableSchema {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_state_store_operations() {
+async fn state_store_operations() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -129,7 +129,7 @@ async fn test_state_store_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_state_store_rollback() {
+async fn state_store_rollback() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -200,7 +200,7 @@ async fn test_state_store_rollback() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_state_store_load_states() {
+async fn state_store_load_states() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -246,7 +246,7 @@ async fn test_state_store_load_states() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_schema_store_operations() {
+async fn schema_store_operations() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -302,7 +302,7 @@ async fn test_schema_store_operations() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_schema_store_load_schemas() {
+async fn schema_store_load_schemas() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -361,7 +361,7 @@ async fn test_schema_store_load_schemas() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_schema_store_versioning() {
+async fn schema_store_versioning() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -429,7 +429,7 @@ async fn test_schema_store_versioning() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_schema_store_upsert_replaces_columns() {
+async fn schema_store_upsert_replaces_columns() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -510,7 +510,7 @@ async fn test_schema_store_upsert_replaces_columns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_schema_cache_eviction() {
+async fn schema_cache_eviction() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -596,7 +596,7 @@ async fn test_schema_cache_eviction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_multiple_pipelines_isolation() {
+async fn multiple_pipelines_isolation() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -708,7 +708,7 @@ async fn test_multiple_pipelines_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_errored_state_with_different_retry_policies() {
+async fn errored_state_with_different_retry_policies() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -752,7 +752,7 @@ async fn test_errored_state_with_different_retry_policies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_state_transitions_and_history() {
+async fn state_transitions_and_history() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -830,7 +830,7 @@ async fn test_state_transitions_and_history() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cleanup_deletes_state_schema_and_metadata_for_table() {
+async fn cleanup_deletes_state_schema_and_metadata_for_table() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -1020,7 +1020,7 @@ async fn test_cleanup_deletes_state_schema_and_metadata_for_table() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_replication_mask_loads_correctly_from_string_bytea() {
+async fn replication_mask_loads_correctly_from_string_bytea() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -1071,7 +1071,7 @@ async fn test_replication_mask_loads_correctly_from_string_bytea() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_replication_mask_various_patterns() {
+async fn replication_mask_various_patterns() {
     init_test_tracing();
 
     let database = spawn_source_database().await;
@@ -1149,7 +1149,7 @@ async fn test_replication_mask_various_patterns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_replication_mask_roundtrip() {
+async fn replication_mask_roundtrip() {
     init_test_tracing();
 
     let database = spawn_source_database().await;

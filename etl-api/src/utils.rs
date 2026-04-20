@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_with_leading_and_trailing_whitespace() {
+    fn trim_string_with_leading_and_trailing_whitespace() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_without_whitespace() {
+    fn trim_string_without_whitespace() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_with_tabs_and_newlines() {
+    fn trim_string_with_tabs_and_newlines() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_empty_string() {
+    fn trim_string_empty_string() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_only_whitespace_becomes_empty() {
+    fn trim_string_only_whitespace_becomes_empty() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_preserves_internal_whitespace() {
+    fn trim_string_preserves_internal_whitespace() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_leading_only() {
+    fn trim_string_leading_only() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_string_trailing_only() {
+    fn trim_string_trailing_only() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(deserialize_with = "trim_string")]
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_option_string_with_whitespace() {
+    fn trim_option_string_with_whitespace() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(default, deserialize_with = "trim_option_string")]
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_option_string_with_null() {
+    fn trim_option_string_with_null() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(default, deserialize_with = "trim_option_string")]
@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_option_string_with_missing_field() {
+    fn trim_option_string_with_missing_field() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(default, deserialize_with = "trim_option_string")]
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_option_string_with_empty_string() {
+    fn trim_option_string_with_empty_string() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(default, deserialize_with = "trim_option_string")]
@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_option_string_whitespace_only_becomes_empty() {
+    fn trim_option_string_whitespace_only_becomes_empty() {
         #[derive(Deserialize)]
         struct TestStruct {
             #[serde(default, deserialize_with = "trim_option_string")]

@@ -127,7 +127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_server_version_basic_versions() {
+    fn extract_server_version_basic_versions() {
         assert_eq!(extract_server_version("15.5"), NonZeroI32::new(150500));
         assert_eq!(extract_server_version("14.2"), NonZeroI32::new(140200));
         assert_eq!(extract_server_version("13.0"), NonZeroI32::new(130000));
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_server_version_with_suffixes() {
+    fn extract_server_version_with_suffixes() {
         assert_eq!(
             extract_server_version("15.5 (Homebrew)"),
             NonZeroI32::new(150500)
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_server_version_patch_versions() {
+    fn extract_server_version_patch_versions() {
         // Test versions with patch numbers
         assert_eq!(extract_server_version("15.5.1"), NonZeroI32::new(150501));
         assert_eq!(extract_server_version("14.10.3"), NonZeroI32::new(141003));
@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_server_version_invalid_inputs() {
+    fn extract_server_version_invalid_inputs() {
         // Test invalid inputs that should return None
         assert_eq!(extract_server_version(""), None);
         assert_eq!(extract_server_version("invalid"), None);
@@ -173,13 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_server_version_zero_versions() {
+    fn extract_server_version_zero_versions() {
         assert_eq!(extract_server_version("0.0.0"), None);
         assert_eq!(extract_server_version("0.0"), None);
     }
 
     #[test]
-    fn test_extract_server_version_whitespace_handling() {
+    fn extract_server_version_whitespace_handling() {
         assert_eq!(extract_server_version("  15.5  "), NonZeroI32::new(150500));
         assert_eq!(
             extract_server_version("15.5\t(Homebrew)"),
