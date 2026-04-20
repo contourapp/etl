@@ -1,3 +1,5 @@
+#![allow(clippy::match_same_arms)]
+
 use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::etl_error;
 use etl::types::{Cell, ColumnSchema, PipelineId, ReplicatedTableSchema, Type, is_array_type};

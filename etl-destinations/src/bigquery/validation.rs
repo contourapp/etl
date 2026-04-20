@@ -263,6 +263,7 @@ pub fn validate_timestamptz_for_bigquery(timestamptz: &DateTime<Utc>) -> EtlResu
 /// Returns an error if any value is outside BigQuery's supported range for its type.
 /// This function checks all temporal types and numeric types for BigQuery compatibility.
 pub fn validate_cell_for_bigquery(cell: &CellNonOptional) -> EtlResult<()> {
+    #[allow(clippy::match_same_arms)]
     match cell {
         CellNonOptional::Null => Ok(()),
         CellNonOptional::Bool(_) => Ok(()),
@@ -289,6 +290,7 @@ pub fn validate_cell_for_bigquery(cell: &CellNonOptional) -> EtlResult<()> {
 ///
 /// Returns an error if any array element is outside BigQuery's supported range for its type.
 pub fn validate_array_cell_for_bigquery(array_cell: &ArrayCellNonOptional) -> EtlResult<()> {
+    #[allow(clippy::match_same_arms)]
     match array_cell {
         ArrayCellNonOptional::Bool(_) => Ok(()),
         ArrayCellNonOptional::String(_) => Ok(()),

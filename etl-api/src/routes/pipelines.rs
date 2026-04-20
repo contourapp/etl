@@ -323,8 +323,8 @@ impl From<TableReplicationPhase> for SimpleTableReplicationState {
             TableReplicationPhase::FinishedCopy => SimpleTableReplicationState::CopiedTable,
             TableReplicationPhase::SyncDone { .. }
             | TableReplicationPhase::SyncWait { .. }
-            | TableReplicationPhase::Catchup { .. } => SimpleTableReplicationState::FollowingWal,
-            TableReplicationPhase::Ready => SimpleTableReplicationState::FollowingWal,
+            | TableReplicationPhase::Catchup { .. }
+            | TableReplicationPhase::Ready => SimpleTableReplicationState::FollowingWal,
             TableReplicationPhase::Errored {
                 reason,
                 solution,
