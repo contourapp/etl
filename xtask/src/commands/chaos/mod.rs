@@ -479,7 +479,7 @@ pub(crate) fn parse_selector(selectors: &[String]) -> anyhow::Result<Labels> {
 /// Derive a short name suitable for a Kubernetes resource name from a label set.
 /// Uses the value of the first label, e.g. `app.kubernetes.io/name=etl` → `"etl"`.
 pub(crate) fn app_name_from_labels(labels: &Labels) -> &str {
-    labels.first().map(|(_, v)| v.as_str()).unwrap_or("app")
+    labels.first().map_or("app", |(_, v)| v.as_str())
 }
 
 fn sel(namespace: &str, labels: Labels) -> Selector {
