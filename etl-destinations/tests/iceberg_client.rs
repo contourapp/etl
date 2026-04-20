@@ -826,7 +826,7 @@ async fn insert_nullable_array() {
     if let Cell::Array(ArrayCell::Numeric(vec)) = &values[12] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|n| n.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[12] = Cell::Array(ArrayCell::String(converted));
     }
@@ -835,14 +835,14 @@ async fn insert_nullable_array() {
     if let Cell::Array(ArrayCell::Json(vec)) = &values[18] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|j| j.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[18] = Cell::Array(ArrayCell::String(converted));
     }
     if let Cell::Array(ArrayCell::Json(vec)) = &values[19] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|j| j.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[19] = Cell::Array(ArrayCell::String(converted));
     }
@@ -1056,7 +1056,7 @@ async fn insert_non_nullable_array() {
     if let Cell::Array(ArrayCell::Numeric(vec)) = &values[12] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|n| n.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[12] = Cell::Array(ArrayCell::String(converted));
     }
@@ -1065,14 +1065,14 @@ async fn insert_non_nullable_array() {
     if let Cell::Array(ArrayCell::Json(vec)) = &values[18] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|j| j.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[18] = Cell::Array(ArrayCell::String(converted));
     }
     if let Cell::Array(ArrayCell::Json(vec)) = &values[19] {
         let converted: Vec<Option<String>> = vec
             .iter()
-            .map(|opt| opt.as_ref().map(|j| j.to_string()))
+            .map(|opt| opt.as_ref().map(ToString::to_string))
             .collect();
         values[19] = Cell::Array(ArrayCell::String(converted));
     }
