@@ -39,7 +39,7 @@ pub async fn create_publication(
         query.push_str(&quoted_name);
 
         if i < publication.tables.len() - 1 {
-            query.push(',')
+            query.push(',');
         }
     }
 
@@ -68,7 +68,7 @@ pub async fn update_publication(
         query.push_str(&quoted_name);
 
         if i < publication.tables.len() - 1 {
-            query.push(',')
+            query.push(',');
         }
     }
 
