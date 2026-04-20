@@ -1725,7 +1725,7 @@ mod tests {
 
         // Test extraction from Cell::Array
         assert!(cell_to_array_cell(&Cell::Array(bool_array.clone())).is_some());
-        assert!(cell_to_array_cell(&Cell::Array(string_array.clone())).is_some());
+        assert!(cell_to_array_cell(&Cell::Array(string_array)).is_some());
 
         // Test non-array cells return None
         assert!(cell_to_array_cell(&Cell::Null).is_none());
@@ -1734,7 +1734,7 @@ mod tests {
         assert!(cell_to_array_cell(&Cell::I32(42)).is_none());
 
         // Verify the extracted array cell is the same
-        if let Some(extracted) = cell_to_array_cell(&Cell::Array(bool_array.clone())) {
+        if let Some(extracted) = cell_to_array_cell(&Cell::Array(bool_array)) {
             if let ArrayCell::Bool(vec) = extracted {
                 assert_eq!(vec.len(), 3);
                 assert_eq!(vec[0], Some(true));
@@ -1767,7 +1767,7 @@ mod tests {
             TableRow::new(vec![Cell::String("not an array".to_string())]), // Non-array cell,
         ];
 
-        let array_ref = build_boolean_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_boolean_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 5);
@@ -1852,7 +1852,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                          // Null cell,
         ];
 
-        let array_ref = build_int32_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_int32_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -1911,7 +1911,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                          // Null cell,
         ];
 
-        let array_ref = build_int64_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_int64_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -1969,7 +1969,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                          // Null cell,
         ];
 
-        let array_ref = build_float32_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_float32_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2026,7 +2026,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                          // Null cell,
         ];
 
-        let array_ref = build_float64_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_float64_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2091,7 +2091,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                             // Null cell,
         ];
 
-        let array_ref = build_string_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_string_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 5);
@@ -2166,7 +2166,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                            // Null cell,
         ];
 
-        let array_ref = build_binary_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_binary_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2226,7 +2226,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                           // Null cell,
         ];
 
-        let array_ref = build_date32_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_date32_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2295,7 +2295,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                           // Null cell,
         ];
 
-        let array_ref = build_time64_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_time64_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2379,7 +2379,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                                // Null cell,
         ];
 
-        let array_ref = build_timestamp_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_timestamp_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2445,7 +2445,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                                  // Null cell,
         ];
 
-        let array_ref = build_timestamptz_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_timestamptz_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2508,7 +2508,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]),                           // Null cell,
         ];
 
-        let array_ref = build_uuid_list_array(&rows, 0, field_ref.clone());
+        let array_ref = build_uuid_list_array(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 4);
@@ -2611,7 +2611,7 @@ mod tests {
             TableRow::new(vec![Cell::Null]), // Null cell,
         ];
 
-        let array_ref = build_list_array_for_strings(&rows, 0, field_ref.clone());
+        let array_ref = build_list_array_for_strings(&rows, 0, field_ref);
         let list_array = array_ref.as_any().downcast_ref::<ListArray>().unwrap();
 
         assert_eq!(list_array.len(), 13);
