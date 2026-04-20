@@ -520,7 +520,7 @@ where
             .await?;
 
         // Add the CDC operation type to all rows (no lock needed).
-        for table_row in table_rows.iter_mut() {
+        for table_row in &mut table_rows {
             table_row
                 .values_mut()
                 .push(BigQueryOperationType::Upsert.into_cell());
