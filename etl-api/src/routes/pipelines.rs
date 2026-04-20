@@ -147,7 +147,8 @@ impl From<K8sCoreError> for PipelineError {
 }
 
 impl PipelineError {
-    pub fn to_message(&self) -> String {
+    fn to_message(&self) -> String {
+        #[allow(clippy::match_same_arms)]
         match self {
             // Do not expose internal database details in error messages.
             PipelineError::SourcesDb(SourcesDbError::Database(_))
