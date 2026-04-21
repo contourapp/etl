@@ -23,7 +23,7 @@ use crate::ducklake::metrics::{
 static NEXT_CONNECTION_INIT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Timeout applied to each foreground DuckLake blocking operation.
-pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Timeout applied to each maintenance DuckLake blocking operation.
 pub(super) const MAINTENANCE_QUERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Timeout applied to each background DuckLake metrics query.
