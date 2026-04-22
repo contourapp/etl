@@ -1,4 +1,4 @@
-use etl::types::{ColumnSchema, Type, is_array_type};
+use etl::types::{ColumnSchema, Type, is_array_type, is_range_array_type, is_range_type};
 use pg_escape::quote_identifier;
 
 /// Returns the DuckLake SQL type string for a given Postgres scalar type.
@@ -53,9 +53,39 @@ fn postgres_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
     }
 }
 
+/// Returns the DuckDB SQL type string for a Postgres scalar range type.
+fn postgres_range_type_to_ducklake_sql(typ: &Type) -> &'static str {
+    match typ {
+        &Type::TSTZ_RANGE => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)",
+        &Type::TS_RANGE => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)",
+        &Type::DATE_RANGE => "STRUCT(\"lower\" DATE, \"upper\" DATE)",
+        &Type::INT4_RANGE => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)",
+        &Type::INT8_RANGE => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)",
+        &Type::NUM_RANGE => "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)",
+        _ => "VARCHAR",
+    }
+}
+
+/// Returns the DuckDB SQL type string for a Postgres range array type.
+fn postgres_range_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
+    match typ {
+        &Type::TSTZ_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]",
+        &Type::TS_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)[]",
+        &Type::DATE_RANGE_ARRAY => "STRUCT(\"lower\" DATE, \"upper\" DATE)[]",
+        &Type::INT4_RANGE_ARRAY => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)[]",
+        &Type::INT8_RANGE_ARRAY => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)[]",
+        &Type::NUM_RANGE_ARRAY => "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)[]",
+        _ => "VARCHAR[]",
+    }
+}
+
 /// Returns the DuckLake SQL type string for a Postgres column type.
 pub fn postgres_column_type_to_ducklake_sql(typ: &Type) -> &'static str {
-    if is_array_type(typ) {
+    if is_range_array_type(typ) {
+        postgres_range_array_type_to_ducklake_sql(typ)
+    } else if is_range_type(typ) {
+        postgres_range_type_to_ducklake_sql(typ)
+    } else if is_array_type(typ) {
         postgres_array_type_to_ducklake_sql(typ)
     } else {
         postgres_scalar_type_to_ducklake_sql(typ)
@@ -149,6 +179,71 @@ mod tests {
         assert_eq!(
             postgres_array_type_to_ducklake_sql(&Type::UUID_ARRAY),
             "UUID[]"
+        );
+    }
+
+    #[test]
+    fn test_range_type_mapping() {
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::TSTZ_RANGE),
+            "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)"
+        );
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::TS_RANGE),
+            "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)"
+        );
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::DATE_RANGE),
+            "STRUCT(\"lower\" DATE, \"upper\" DATE)"
+        );
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::INT4_RANGE),
+            "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)"
+        );
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::INT8_RANGE),
+            "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)"
+        );
+        assert_eq!(
+            postgres_range_type_to_ducklake_sql(&Type::NUM_RANGE),
+            "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)"
+        );
+    }
+
+    #[test]
+    fn test_range_array_type_mapping() {
+        assert_eq!(
+            postgres_range_array_type_to_ducklake_sql(&Type::TSTZ_RANGE_ARRAY),
+            "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]"
+        );
+        assert_eq!(
+            postgres_range_array_type_to_ducklake_sql(&Type::TS_RANGE_ARRAY),
+            "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)[]"
+        );
+        assert_eq!(
+            postgres_range_array_type_to_ducklake_sql(&Type::DATE_RANGE_ARRAY),
+            "STRUCT(\"lower\" DATE, \"upper\" DATE)[]"
+        );
+    }
+
+    #[test]
+    fn test_column_type_dispatches_range_types() {
+        assert_eq!(
+            postgres_column_type_to_ducklake_sql(&Type::TSTZ_RANGE),
+            "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)"
+        );
+        assert_eq!(
+            postgres_column_type_to_ducklake_sql(&Type::TSTZ_RANGE_ARRAY),
+            "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]"
+        );
+        // Non-range types still work
+        assert_eq!(
+            postgres_column_type_to_ducklake_sql(&Type::INT4),
+            "INTEGER"
+        );
+        assert_eq!(
+            postgres_column_type_to_ducklake_sql(&Type::INT4_ARRAY),
+            "INTEGER[]"
         );
     }
 
