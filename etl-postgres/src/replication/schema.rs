@@ -132,7 +132,15 @@ define_type_mappings! {
     NUM_RANGE => "NUM_RANGE",
     TS_RANGE => "TS_RANGE",
     TSTZ_RANGE => "TSTZ_RANGE",
-    DATE_RANGE => "DATE_RANGE"
+    DATE_RANGE => "DATE_RANGE",
+
+    // Range array types
+    INT4_RANGE_ARRAY => "INT4_RANGE_ARRAY",
+    INT8_RANGE_ARRAY => "INT8_RANGE_ARRAY",
+    NUM_RANGE_ARRAY => "NUM_RANGE_ARRAY",
+    TS_RANGE_ARRAY => "TS_RANGE_ARRAY",
+    TSTZ_RANGE_ARRAY => "TSTZ_RANGE_ARRAY",
+    DATE_RANGE_ARRAY => "DATE_RANGE_ARRAY"
 }
 
 /// Stores a table schema in the database.
