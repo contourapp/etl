@@ -11,9 +11,10 @@ fn postgres_scalar_type_to_ducklake_sql(typ: &Type) -> &'static str {
         &Type::INT8 => "BIGINT",
         &Type::FLOAT4 => "FLOAT",
         &Type::FLOAT8 => "DOUBLE",
-        // NUMERIC is mapped to VARCHAR to preserve precision without loss,
-        // since DuckDB DECIMAL needs explicit scale/precision we don't have in the Type.
-        &Type::NUMERIC => "VARCHAR",
+        // NUMERIC maps to DECIMAL(38, 10): DuckDB's max precision with 10
+        // fractional digits. Values are cast at write time via SQL literals so
+        // NaN/Infinity can be coerced to NULL (DECIMAL has no representation).
+        &Type::NUMERIC => "DECIMAL(38, 10)",
         &Type::DATE => "DATE",
         &Type::TIME => "TIME",
         &Type::TIMESTAMP => "TIMESTAMP",
@@ -40,7 +41,7 @@ fn postgres_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
         &Type::INT8_ARRAY => "BIGINT[]",
         &Type::FLOAT4_ARRAY => "FLOAT[]",
         &Type::FLOAT8_ARRAY => "DOUBLE[]",
-        &Type::NUMERIC_ARRAY => "VARCHAR[]",
+        &Type::NUMERIC_ARRAY => "DECIMAL(38, 10)[]",
         &Type::DATE_ARRAY => "DATE[]",
         &Type::TIME_ARRAY => "TIME[]",
         &Type::TIMESTAMP_ARRAY => "TIMESTAMP[]",
@@ -61,7 +62,7 @@ fn postgres_range_type_to_ducklake_sql(typ: &Type) -> &'static str {
         &Type::DATE_RANGE => "STRUCT(\"lower\" DATE, \"upper\" DATE)",
         &Type::INT4_RANGE => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)",
         &Type::INT8_RANGE => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)",
-        &Type::NUM_RANGE => "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)",
+        &Type::NUM_RANGE => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))",
         _ => "VARCHAR",
     }
 }
@@ -74,7 +75,7 @@ fn postgres_range_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
         &Type::DATE_RANGE_ARRAY => "STRUCT(\"lower\" DATE, \"upper\" DATE)[]",
         &Type::INT4_RANGE_ARRAY => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)[]",
         &Type::INT8_RANGE_ARRAY => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)[]",
-        &Type::NUM_RANGE_ARRAY => "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)[]",
+        &Type::NUM_RANGE_ARRAY => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))[]",
         _ => "VARCHAR[]",
     }
 }
@@ -139,7 +140,7 @@ mod tests {
         );
         assert_eq!(
             postgres_scalar_type_to_ducklake_sql(&Type::NUMERIC),
-            "VARCHAR"
+            "DECIMAL(38, 10)"
         );
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::DATE), "DATE");
         assert_eq!(postgres_scalar_type_to_ducklake_sql(&Type::TIME), "TIME");
@@ -206,7 +207,7 @@ mod tests {
         );
         assert_eq!(
             postgres_range_type_to_ducklake_sql(&Type::NUM_RANGE),
-            "STRUCT(\"lower\" VARCHAR, \"upper\" VARCHAR)"
+            "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))"
         );
     }
 
