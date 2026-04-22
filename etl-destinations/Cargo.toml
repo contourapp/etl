@@ -59,7 +59,7 @@ arrow = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 chrono = { workspace = true }
-duckdb = { workspace = true, optional = true, features = ["bundled", "json", "parquet", "r2d2"] }
+duckdb = { workspace = true, optional = true, features = ["json", "parquet", "r2d2"] }
 gcp-bigquery-client = { workspace = true, optional = true, features = ["rust-tls", "aws-lc-rs"] }
 iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }

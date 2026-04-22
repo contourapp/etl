@@ -1,6 +1,8 @@
 use chrono::{NaiveDate, NaiveTime};
 use duckdb::types::{TimeUnit, Value};
-use etl::types::{ArrayCell, Cell, ColumnSchema, TableRow, Type, is_range_array_type, is_range_type};
+use etl::types::{
+    ArrayCell, Cell, ColumnSchema, PgNumeric, TableRow, Type, is_range_array_type, is_range_type,
+};
 use pg_escape::quote_literal;
 
 /// Prepared row payload reused across retry attempts.
@@ -97,8 +99,20 @@ fn duckdb_bound_type(typ: &Type) -> &'static str {
         &Type::DATE_RANGE | &Type::DATE_RANGE_ARRAY => "DATE",
         &Type::INT4_RANGE | &Type::INT4_RANGE_ARRAY => "INTEGER",
         &Type::INT8_RANGE | &Type::INT8_RANGE_ARRAY => "BIGINT",
-        &Type::NUM_RANGE | &Type::NUM_RANGE_ARRAY => "VARCHAR",
+        &Type::NUM_RANGE | &Type::NUM_RANGE_ARRAY => "DECIMAL(38, 10)",
         _ => "VARCHAR",
+    }
+}
+
+/// Formats a bound value as a DuckDB typed literal.
+///
+/// Parameterized types (e.g. `DECIMAL(38, 10)`) can't be used in the
+/// `TYPE 'value'` typed-literal form, so fall back to `CAST('value' AS TYPE)`.
+fn format_typed_literal(value: &str, bound_type: &str) -> String {
+    if bound_type.contains('(') {
+        format!("CAST('{value}' AS {bound_type})")
+    } else {
+        format!("{bound_type} '{value}'")
     }
 }
 
@@ -126,12 +140,12 @@ fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
     let lower_lit = if lower.is_empty() {
         "NULL".to_string()
     } else {
-        format!("{bound_type} '{lower}'")
+        format_typed_literal(lower, bound_type)
     };
     let upper_lit = if upper.is_empty() {
         "NULL".to_string()
     } else {
-        format!("{bound_type} '{upper}'")
+        format_typed_literal(upper, bound_type)
     };
 
     format!("{{'lower': {lower_lit}, 'upper': {upper_lit}}}")
@@ -209,8 +223,26 @@ fn split_pg_array_elements(s: &str) -> Vec<&str> {
 }
 
 /// Returns whether a cell must bypass the DuckDB appender path.
+///
+/// `Cell::Numeric` is routed through SQL literals so values can be cast
+/// into `DECIMAL(38, 10)` and NaN/Infinity coerced to NULL without relying
+/// on `rust_decimal` (which tops out at ~28 significant digits).
 fn cell_requires_sql_literals(cell: &Cell) -> bool {
-    matches!(cell, Cell::Array(_))
+    matches!(cell, Cell::Array(_) | Cell::Numeric(_))
+}
+
+/// Renders a `PgNumeric` as a DuckDB `DECIMAL(38, 10)` literal.
+///
+/// NaN/Infinity map to NULL since DECIMAL has no representation for them.
+fn numeric_to_decimal_literal(n: &PgNumeric) -> String {
+    match n {
+        PgNumeric::NaN | PgNumeric::PositiveInfinity | PgNumeric::NegativeInfinity => {
+            "NULL".to_string()
+        }
+        PgNumeric::Value { .. } => {
+            format!("CAST({} AS DECIMAL(38, 10))", quote_literal(&n.to_string()))
+        }
+    }
 }
 
 /// Converts a [`Cell`] into a DuckDB SQL literal expression.
@@ -231,7 +263,7 @@ fn cell_to_sql_literal(cell: Cell) -> String {
         Cell::I64(i) => i.to_string(),
         Cell::F32(f) => float_literal(f as f64, false),
         Cell::F64(f) => float_literal(f, true),
-        Cell::Numeric(n) => quote_literal(&n.to_string()),
+        Cell::Numeric(n) => numeric_to_decimal_literal(&n),
         Cell::Date(d) => format!("DATE '{}'", d.format("%Y-%m-%d")),
         Cell::Time(t) => format!("TIME '{}'", t.format("%H:%M:%S%.6f")),
         Cell::Timestamp(dt) => {
@@ -338,7 +370,8 @@ fn array_cell_to_sql_literal(arr: ArrayCell) -> String {
         ArrayCell::Numeric(v) => v
             .into_iter()
             .map(|o| {
-                o.map_or_else(|| "NULL".to_string(), |value| quote_literal(&value.to_string()))
+                o.map(|value| numeric_to_decimal_literal(&value))
+                    .unwrap_or_else(|| "NULL".to_string())
             })
             .collect(),
         ArrayCell::Date(v) => v
@@ -457,7 +490,9 @@ fn cell_to_value(cell: Cell) -> Value {
         Cell::I64(i) => Value::BigInt(i),
         Cell::F32(f) => Value::Float(f),
         Cell::F64(f) => Value::Double(f),
-        // NUMERIC stored as VARCHAR to avoid precision loss.
+        // Unreachable: `cell_requires_sql_literals` routes `Cell::Numeric`
+        // through the SQL-literal path so NaN/Infinity can be coerced and
+        // values can be cast to `DECIMAL(38, 10)` without `rust_decimal`.
         Cell::Numeric(n) => Value::Text(n.to_string()),
         Cell::Date(d) => Value::Date32(d.signed_duration_since(epoch_date).num_days() as i32),
         Cell::Time(t) => {
@@ -562,7 +597,51 @@ mod tests {
     }
 
     #[test]
-    fn array_cell_to_sql_literal_preserves_nulls() {
+    fn test_numeric_cell_emits_decimal_cast_literal() {
+        let n: PgNumeric = "123.45".parse().unwrap();
+        assert_eq!(
+            cell_to_sql_literal(Cell::Numeric(n)),
+            "CAST('123.45' AS DECIMAL(38, 10))"
+        );
+    }
+
+    #[test]
+    fn test_numeric_cell_coerces_nan_and_infinity_to_null() {
+        assert_eq!(cell_to_sql_literal(Cell::Numeric(PgNumeric::NaN)), "NULL");
+        assert_eq!(
+            cell_to_sql_literal(Cell::Numeric(PgNumeric::PositiveInfinity)),
+            "NULL"
+        );
+        assert_eq!(
+            cell_to_sql_literal(Cell::Numeric(PgNumeric::NegativeInfinity)),
+            "NULL"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rows_routes_numeric_through_sql_literals() {
+        let schemas = vec![
+            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
+            ColumnSchema::new("amount".into(), Type::NUMERIC, -1, true, false),
+        ];
+        let n: PgNumeric = "-9.87".parse().unwrap();
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![Cell::I32(1), Cell::Numeric(n)])],
+            &schemas,
+        );
+
+        match prepared {
+            PreparedRows::SqlLiterals(rows) => {
+                assert_eq!(rows, vec!["(1, CAST('-9.87' AS DECIMAL(38, 10)))"]);
+            }
+            PreparedRows::Appender(_) => {
+                panic!("expected sql literal fallback for numeric column")
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_cell_to_sql_literal_preserves_nulls() {
         assert_eq!(
             array_cell_to_sql_literal(ArrayCell::I32(vec![Some(1), None, Some(3)])),
             "[1, NULL, 3]"
