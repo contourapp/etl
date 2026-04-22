@@ -643,7 +643,7 @@ pub(super) fn prepare_copy_table_batch(
         first_sequence_key: None,
         last_sequence_key: None,
         action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
-            prepare_rows(table_rows),
+            prepare_rows(table_rows, &table_schema.column_schemas),
         )]),
     })
 }
@@ -1024,6 +1024,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
+                        &table_schema.column_schemas,
                     )));
                 }
                 delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
@@ -1032,6 +1033,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
+                        &table_schema.column_schemas,
                     )));
                 }
                 if !delete_predicates.is_empty() {
@@ -1070,6 +1072,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
+                        &table_schema.column_schemas,
                     )));
                 }
                 if !delete_predicates.is_empty() {
@@ -1083,13 +1086,19 @@ fn prepare_table_mutations(
                     predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
                     origin: "replace",
                 });
-                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(vec![row])));
+                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
+                    vec![row],
+                    &table_schema.column_schemas,
+                )));
             }
         }
     }
 
     if !upsert_rows.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(upsert_rows)));
+        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
+            upsert_rows,
+            &table_schema.column_schemas,
+        )));
     }
     if !delete_predicates.is_empty() {
         prepared_mutations.push(PreparedTableMutation::Delete {

@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, NaiveTime};
 use duckdb::types::{TimeUnit, Value};
-use etl::types::{ArrayCell, Cell, TableRow};
+use etl::types::{ArrayCell, Cell, ColumnSchema, TableRow, Type, is_range_array_type, is_range_type};
 use pg_escape::quote_literal;
 
 /// Prepared row payload reused across retry attempts.
@@ -10,10 +10,24 @@ pub(super) enum PreparedRows {
 }
 
 /// Converts table rows into a retryable payload for DuckDB writes.
-pub(super) fn prepare_rows(table_rows: Vec<TableRow>) -> PreparedRows {
-    if table_rows.iter().any(|row| row.values().iter().any(cell_requires_sql_literals)) {
+pub(super) fn prepare_rows(
+    table_rows: Vec<TableRow>,
+    column_schemas: &[ColumnSchema],
+) -> PreparedRows {
+    let has_range_columns = column_schemas
+        .iter()
+        .any(|cs| is_range_type(&cs.typ) || is_range_array_type(&cs.typ));
+
+    if has_range_columns
+        || table_rows
+            .iter()
+            .any(|row| row.values().iter().any(cell_requires_sql_literals))
+    {
         return PreparedRows::SqlLiterals(
-            table_rows.into_iter().map(table_row_to_sql_literal).collect(),
+            table_rows
+                .into_iter()
+                .map(|row| table_row_to_sql_literal_typed(&row, column_schemas))
+                .collect(),
         );
     }
 
@@ -30,19 +44,173 @@ pub(super) fn table_row_to_sql_literal_ref(row: &TableRow) -> String {
     format!("({})", row.values().iter().map(cell_to_sql_literal_ref).collect::<Vec<_>>().join(", "))
 }
 
+/// Serializes a borrowed row into a SQL `VALUES (...)` tuple, using column
+/// type information to emit struct literals for range-typed columns.
+fn table_row_to_sql_literal_typed(row: &TableRow, column_schemas: &[ColumnSchema]) -> String {
+    let literals: Vec<String> = row
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            if let Some(cs) = column_schemas.get(i) {
+                cell_to_sql_literal_typed(cell, &cs.typ)
+            } else {
+                cell_to_sql_literal_ref(cell)
+            }
+        })
+        .collect();
+    format!("({})", literals.join(", "))
+}
+
 /// Serializes a borrowed cell into a DuckDB SQL literal expression.
 pub(super) fn cell_to_sql_literal_ref(cell: &Cell) -> String {
     cell_to_sql_literal(cell_to_owned(cell))
 }
 
+/// Serializes a cell into a DuckDB SQL literal, using column type to emit
+/// struct literals for range-typed columns.
+fn cell_to_sql_literal_typed(cell: &Cell, typ: &Type) -> String {
+    if is_range_type(typ) {
+        if matches!(cell, Cell::Null) {
+            return "NULL".to_string();
+        }
+        if let Cell::String(s) = cell {
+            return range_text_to_struct_literal(s, duckdb_bound_type(typ));
+        }
+    }
+    if is_range_array_type(typ) {
+        if matches!(cell, Cell::Null) {
+            return "NULL".to_string();
+        }
+        if let Cell::String(s) = cell {
+            return range_array_text_to_list_literal(s, duckdb_bound_type(typ));
+        }
+    }
+    cell_to_sql_literal_ref(cell)
+}
+
+/// Returns the DuckDB type keyword for the bounds of a range type.
+fn duckdb_bound_type(typ: &Type) -> &'static str {
+    match typ {
+        &Type::TSTZ_RANGE | &Type::TSTZ_RANGE_ARRAY => "TIMESTAMPTZ",
+        &Type::TS_RANGE | &Type::TS_RANGE_ARRAY => "TIMESTAMP",
+        &Type::DATE_RANGE | &Type::DATE_RANGE_ARRAY => "DATE",
+        &Type::INT4_RANGE | &Type::INT4_RANGE_ARRAY => "INTEGER",
+        &Type::INT8_RANGE | &Type::INT8_RANGE_ARRAY => "BIGINT",
+        &Type::NUM_RANGE | &Type::NUM_RANGE_ARRAY => "VARCHAR",
+        _ => "VARCHAR",
+    }
+}
+
+/// Parses a single Postgres range text representation into a DuckDB struct literal.
+///
+/// Input: `[2026-03-24 15:32:00+00,2026-03-24 20:20:00+00)`
+/// Output: `{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}`
+fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
+    let text = text.trim();
+    if text == "empty" {
+        return "NULL".to_string();
+    }
+
+    // Strip leading bracket [ or ( and trailing ) or ]
+    let inner = &text[1..text.len() - 1];
+    let (lower, upper) = match inner.split_once(',') {
+        Some((l, u)) => (l.trim(), u.trim()),
+        None => return "NULL".to_string(),
+    };
+
+    // Strip surrounding quotes from bound values (present in array element format)
+    let lower = lower.trim_matches('"');
+    let upper = upper.trim_matches('"');
+
+    let lower_lit = if lower.is_empty() {
+        "NULL".to_string()
+    } else {
+        format!("{bound_type} '{lower}'")
+    };
+    let upper_lit = if upper.is_empty() {
+        "NULL".to_string()
+    } else {
+        format!("{bound_type} '{upper}'")
+    };
+
+    format!("{{'lower': {lower_lit}, 'upper': {upper_lit}}}")
+}
+
+/// Parses a Postgres range array text representation into a DuckDB list of struct literals.
+///
+/// Input: `{"[\"2026-03-24 15:32:00+00\",\"2026-03-24 20:20:00+00\")"}`
+/// Output: `[{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}]`
+fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
+    let text = text.trim();
+    if text == "{}" {
+        return "[]".to_string();
+    }
+
+    // Strip outer { }
+    let inner = &text[1..text.len() - 1];
+
+    // Split elements on "," boundaries (each element is quoted with ")
+    let elements = split_pg_array_elements(inner);
+
+    let literals: Vec<String> = elements
+        .into_iter()
+        .map(|elem| {
+            if elem == "NULL" {
+                "NULL".to_string()
+            } else {
+                // Unescape: remove surrounding quotes and unescape \"
+                let unquoted = elem
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .replace("\\\"", "\"");
+                range_text_to_struct_literal(&unquoted, bound_type)
+            }
+        })
+        .collect();
+
+    format!("[{}]", literals.join(", "))
+}
+
+/// Splits a Postgres array interior string into individual elements.
+///
+/// Elements may be: unquoted `NULL`, or quoted strings like `"[\"a\",\"b\")"`.
+/// Commas inside quotes are not treated as separators.
+fn split_pg_array_elements(s: &str) -> Vec<&str> {
+    let mut elements = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' if !in_quotes => {
+                in_quotes = true;
+            }
+            b'"' if in_quotes => {
+                // Check for escaped quote \"
+                if i > 0 && bytes[i - 1] == b'\\' {
+                    // escaped quote, stay in quotes
+                } else {
+                    in_quotes = false;
+                }
+            }
+            b',' if !in_quotes => {
+                elements.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    elements.push(&s[start..]);
+    elements
+}
+
 /// Returns whether a cell must bypass the DuckDB appender path.
 fn cell_requires_sql_literals(cell: &Cell) -> bool {
     matches!(cell, Cell::Array(_))
-}
-
-/// Serializes a row into a SQL `VALUES (...)` tuple.
-fn table_row_to_sql_literal(row: TableRow) -> String {
-    table_row_to_sql_literal_ref(&row)
 }
 
 /// Converts a [`Cell`] into a DuckDB SQL literal expression.
@@ -409,17 +577,143 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rows_uses_sql_literals_for_arrays() {
-        let prepared = prepare_rows(vec![TableRow::new(vec![
-            Cell::I32(1),
-            Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)])),
-        ])]);
+    fn test_prepare_rows_uses_sql_literals_for_arrays() {
+        let schemas = vec![
+            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
+            ColumnSchema::new("tags".into(), Type::INT4_ARRAY, -1, true, false),
+        ];
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![
+                Cell::I32(1),
+                Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)])),
+            ])],
+            &schemas,
+        );
 
         match prepared {
             PreparedRows::SqlLiterals(rows) => {
                 assert_eq!(rows, vec!["(1, [1, NULL, 3])"]);
             }
             PreparedRows::Appender(_) => panic!("expected sql literal fallback"),
+        }
+    }
+
+    #[test]
+    fn test_range_text_to_struct_literal_standard() {
+        assert_eq!(
+            range_text_to_struct_literal("[2026-03-24 15:32:00+00,2026-03-24 20:20:00+00)", "TIMESTAMPTZ"),
+            "{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}"
+        );
+    }
+
+    #[test]
+    fn test_range_text_to_struct_literal_empty() {
+        assert_eq!(range_text_to_struct_literal("empty", "TIMESTAMPTZ"), "NULL");
+    }
+
+    #[test]
+    fn test_range_text_to_struct_literal_unbounded_upper() {
+        assert_eq!(
+            range_text_to_struct_literal("[2026-01-01,)", "DATE"),
+            "{'lower': DATE '2026-01-01', 'upper': NULL}"
+        );
+    }
+
+    #[test]
+    fn test_range_text_to_struct_literal_unbounded_lower() {
+        assert_eq!(
+            range_text_to_struct_literal("(,2026-12-31]", "DATE"),
+            "{'lower': NULL, 'upper': DATE '2026-12-31'}"
+        );
+    }
+
+    #[test]
+    fn test_range_text_to_struct_literal_fully_unbounded() {
+        assert_eq!(
+            range_text_to_struct_literal("(,)", "INTEGER"),
+            "{'lower': NULL, 'upper': NULL}"
+        );
+    }
+
+    #[test]
+    fn test_range_array_text_to_list_literal_single() {
+        assert_eq!(
+            range_array_text_to_list_literal(
+                r#"{"[\"2026-03-24 15:32:00+00\",\"2026-03-24 20:20:00+00\")"}"#,
+                "TIMESTAMPTZ"
+            ),
+            "[{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}]"
+        );
+    }
+
+    #[test]
+    fn test_range_array_text_to_list_literal_empty() {
+        assert_eq!(range_array_text_to_list_literal("{}", "TIMESTAMPTZ"), "[]");
+    }
+
+    #[test]
+    fn test_range_array_text_to_list_literal_with_null() {
+        assert_eq!(
+            range_array_text_to_list_literal(
+                r#"{NULL,"[\"1\",\"10\")"}"#,
+                "INTEGER"
+            ),
+            "[NULL, {'lower': INTEGER '1', 'upper': INTEGER '10'}]"
+        );
+    }
+
+    #[test]
+    fn test_range_array_text_to_list_literal_multiple() {
+        assert_eq!(
+            range_array_text_to_list_literal(
+                r#"{"[\"2026-01-01\",\"2026-02-01\")","[\"2026-03-01\",\"2026-04-01\")"}"#,
+                "DATE"
+            ),
+            "[{'lower': DATE '2026-01-01', 'upper': DATE '2026-02-01'}, {'lower': DATE '2026-03-01', 'upper': DATE '2026-04-01'}]"
+        );
+    }
+
+    #[test]
+    fn test_prepare_rows_uses_sql_literals_for_range_columns() {
+        let schemas = vec![
+            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
+            ColumnSchema::new("effective_range".into(), Type::TSTZ_RANGE_ARRAY, -1, true, false),
+        ];
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![
+                Cell::I32(1),
+                Cell::String(r#"{"[\"2026-03-24 15:32:00+00\",\"2026-03-24 20:20:00+00\")"}"#.to_string()),
+            ])],
+            &schemas,
+        );
+
+        match prepared {
+            PreparedRows::SqlLiterals(rows) => {
+                assert_eq!(
+                    rows,
+                    vec!["(1, [{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}])"]
+                );
+            }
+            PreparedRows::Appender(_) => panic!("expected sql literal fallback for range columns"),
+        }
+    }
+
+    #[test]
+    fn test_prepare_rows_null_range_column() {
+        let schemas = vec![
+            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
+            ColumnSchema::new("r".into(), Type::TSTZ_RANGE, -1, true, false),
+        ];
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![Cell::I32(1), Cell::Null])],
+            &schemas,
+        );
+
+        match prepared {
+            PreparedRows::SqlLiterals(rows) => {
+                assert_eq!(rows, vec!["(1, NULL)"]);
+            }
+            PreparedRows::Appender(_) => panic!("expected sql literal fallback for range columns"),
         }
     }
 }

@@ -8,6 +8,32 @@ pub fn convert_type_oid_to_type(type_oid: u32) -> Type {
     Type::from_oid(type_oid).unwrap_or(Type::TEXT)
 }
 
+/// Returns whether the Postgres type is a scalar range type.
+pub fn is_range_type(typ: &Type) -> bool {
+    matches!(
+        typ,
+        &Type::INT4_RANGE
+            | &Type::INT8_RANGE
+            | &Type::NUM_RANGE
+            | &Type::TS_RANGE
+            | &Type::TSTZ_RANGE
+            | &Type::DATE_RANGE
+    )
+}
+
+/// Returns whether the Postgres type is a range array type.
+pub fn is_range_array_type(typ: &Type) -> bool {
+    matches!(
+        typ,
+        &Type::INT4_RANGE_ARRAY
+            | &Type::INT8_RANGE_ARRAY
+            | &Type::NUM_RANGE_ARRAY
+            | &Type::TS_RANGE_ARRAY
+            | &Type::TSTZ_RANGE_ARRAY
+            | &Type::DATE_RANGE_ARRAY
+    )
+}
+
 /// Returns whether the Postgres type is an array type.
 pub fn is_array_type(typ: &Type) -> bool {
     matches!(
@@ -134,5 +160,35 @@ mod tests {
             generate_sequence_number(PgLsn::from(u64::MAX), PgLsn::from(0)),
             "0000000000000000/ffffffffffffffff"
         );
+    }
+
+    #[test]
+    fn test_is_range_type() {
+        assert!(is_range_type(&Type::INT4_RANGE));
+        assert!(is_range_type(&Type::INT8_RANGE));
+        assert!(is_range_type(&Type::NUM_RANGE));
+        assert!(is_range_type(&Type::TS_RANGE));
+        assert!(is_range_type(&Type::TSTZ_RANGE));
+        assert!(is_range_type(&Type::DATE_RANGE));
+
+        // Not range types
+        assert!(!is_range_type(&Type::INT4));
+        assert!(!is_range_type(&Type::TEXT));
+        assert!(!is_range_type(&Type::INT4_RANGE_ARRAY));
+    }
+
+    #[test]
+    fn test_is_range_array_type() {
+        assert!(is_range_array_type(&Type::INT4_RANGE_ARRAY));
+        assert!(is_range_array_type(&Type::INT8_RANGE_ARRAY));
+        assert!(is_range_array_type(&Type::NUM_RANGE_ARRAY));
+        assert!(is_range_array_type(&Type::TS_RANGE_ARRAY));
+        assert!(is_range_array_type(&Type::TSTZ_RANGE_ARRAY));
+        assert!(is_range_array_type(&Type::DATE_RANGE_ARRAY));
+
+        // Not range array types
+        assert!(!is_range_array_type(&Type::INT4_RANGE));
+        assert!(!is_range_array_type(&Type::INT4_ARRAY));
+        assert!(!is_range_array_type(&Type::TEXT));
     }
 }
