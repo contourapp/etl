@@ -89,6 +89,13 @@ pub enum ErrorKind {
     DestinationAtomicBatchRetryable,
     SourceLockTimeout,
     SourceOperationCanceled,
+    /// Transient backend failure on the source database — e.g. walsender
+    /// `wal_sender_timeout` while shipping WAL pages, internal Postgres
+    /// errors, or system-level recoverables. Distinct from
+    /// [`SourceQueryFailed`] (which covers permanent query/syntax errors)
+    /// so the retry policy can auto-retry transient faults without
+    /// auto-retrying syntax errors that map to the same state.
+    SourceTransientFailure,
 
     // Schema & Mapping Errors
     SourceSchemaError,
@@ -614,10 +621,14 @@ impl From<tokio_postgres::Error> for EtlError {
                         (ErrorKind::InvalidState, "PostgreSQL transaction failed")
                     }
 
-                    // System errors (58xxx, XX xxx)
-                    SqlState::SYSTEM_ERROR | SqlState::INTERNAL_ERROR => {
-                        (ErrorKind::SourceQueryFailed, "PostgreSQL system error")
-                    }
+                    // System errors (58xxx, XX xxx) — transient, auto-retriable.
+                    // Includes walsender `wal_sender_timeout` during catch-up,
+                    // which previously fell into SourceQueryFailed (Manual
+                    // retry) and silently abandoned the slot.
+                    SqlState::SYSTEM_ERROR | SqlState::INTERNAL_ERROR => (
+                        ErrorKind::SourceTransientFailure,
+                        "PostgreSQL system error",
+                    ),
                     SqlState::IO_ERROR => (ErrorKind::SourceIoError, "PostgreSQL I/O error"),
 
                     // Operator intervention errors (57xxx)

@@ -47,6 +47,7 @@ pub static ETL_API_OPTIONS: LazyLock<PgConnectionOptions> = LazyLock::new(|| PgC
     lock_timeout: 5_000,
     idle_in_transaction_session_timeout: 60_000,
     application_name: APP_NAME_API.to_string(),
+    wal_sender_timeout: 0,
 });
 
 /// Connection options for database migrations.
@@ -64,16 +65,22 @@ pub static ETL_MIGRATION_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 10_000,
         idle_in_transaction_session_timeout: 60_000,
         application_name: APP_NAME_REPLICATOR_MIGRATIONS.to_string(),
+        wal_sender_timeout: 0,
     });
 
 /// Connection options for logical replication streams.
 ///
-/// Disables statement, lock, and idle timeouts to allow large COPY operations and long-running
-/// transactions during initial table synchronization and WAL streaming.
+/// Disables statement, lock, idle, and walsender timeouts to allow large COPY operations
+/// and long-running transactions during initial table synchronization and WAL streaming.
 ///
 /// Lock timeout is disabled because `CREATE_REPLICATION_SLOT` must wait for all in-progress
 /// write transactions to reach a consistent snapshot point. On heavily-loaded databases this
 /// can take minutes, and a timeout would only cause retries that will also fail.
+///
+/// `wal_sender_timeout` is disabled because catch-up reads on managed Postgres providers
+/// (Neon, etc.) can fault to cold-tier storage and individually take well over the default
+/// 60s send window. A walsender timeout there cascades to a slot-disconnect, retained-WAL
+/// growth, and eventual slot invalidation.
 pub static ETL_REPLICATION_OPTIONS: LazyLock<PgConnectionOptions> =
     LazyLock::new(|| PgConnectionOptions {
         datestyle: COMMON_DATESTYLE.to_string(),
@@ -85,6 +92,7 @@ pub static ETL_REPLICATION_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 0,
         idle_in_transaction_session_timeout: 0,
         application_name: APP_NAME_REPLICATOR_STREAMING.to_string(),
+        wal_sender_timeout: 0,
     });
 
 /// Connection options for accessing ETL state metadata in the source database.
@@ -102,6 +110,7 @@ pub static ETL_STATE_MANAGEMENT_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 10_000,
         idle_in_transaction_session_timeout: 60_000,
         application_name: APP_NAME_REPLICATOR_STATE.to_string(),
+        wal_sender_timeout: 0,
     });
 
 /// Postgres server options for ETL workloads.
@@ -128,6 +137,12 @@ pub struct PgConnectionOptions {
     pub idle_in_transaction_session_timeout: u32,
     /// Sets the application name to be reported in statistics views and logs for connection identification.
     pub application_name: String,
+    /// Maximum time in milliseconds the walsender process waits to send WAL pages
+    /// before terminating the connection. `0` disables the timeout.
+    /// Only meaningful for replication connections; ignored by non-walsender backends.
+    /// Set to `0` for streaming workloads to survive cold-storage WAL fetches that
+    /// can exceed Postgres's 60-second default.
+    pub wal_sender_timeout: u32,
 }
 
 impl PgConnectionOptions {
@@ -136,7 +151,7 @@ impl PgConnectionOptions {
     /// Returns space-separated `-c key=value` pairs suitable for the options parameter.
     pub fn to_options_string(&self) -> String {
         format!(
-            "-c datestyle={} -c intervalstyle={} -c extra_float_digits={} -c client_encoding={} -c timezone={} -c statement_timeout={} -c lock_timeout={} -c idle_in_transaction_session_timeout={} -c application_name={}",
+            "-c datestyle={} -c intervalstyle={} -c extra_float_digits={} -c client_encoding={} -c timezone={} -c statement_timeout={} -c lock_timeout={} -c idle_in_transaction_session_timeout={} -c application_name={} -c wal_sender_timeout={}",
             self.datestyle,
             self.intervalstyle,
             self.extra_float_digits,
@@ -145,7 +160,8 @@ impl PgConnectionOptions {
             self.statement_timeout,
             self.lock_timeout,
             self.idle_in_transaction_session_timeout,
-            self.application_name
+            self.application_name,
+            self.wal_sender_timeout
         )
     }
 
@@ -174,6 +190,10 @@ impl PgConnectionOptions {
             (
                 "application_name".to_string(),
                 self.application_name.clone(),
+            ),
+            (
+                "wal_sender_timeout".to_string(),
+                self.wal_sender_timeout.to_string(),
             ),
         ]
     }
@@ -412,7 +432,7 @@ mod tests {
 
         assert_eq!(
             options_string,
-            "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3 -c client_encoding=UTF8 -c timezone=UTC -c statement_timeout=0 -c lock_timeout=0 -c idle_in_transaction_session_timeout=0 -c application_name=supabase_etl_replicator_streaming"
+            "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3 -c client_encoding=UTF8 -c timezone=UTC -c statement_timeout=0 -c lock_timeout=0 -c idle_in_transaction_session_timeout=0 -c application_name=supabase_etl_replicator_streaming -c wal_sender_timeout=0"
         );
     }
 
@@ -420,7 +440,7 @@ mod tests {
     fn test_state_management_options_key_value_pairs() {
         let pairs = ETL_STATE_MANAGEMENT_OPTIONS.to_key_value_pairs();
 
-        assert_eq!(pairs.len(), 9);
+        assert_eq!(pairs.len(), 10);
         assert!(pairs.contains(&("datestyle".to_string(), "ISO".to_string())));
         assert!(pairs.contains(&("intervalstyle".to_string(), "postgres".to_string())));
         assert!(pairs.contains(&("extra_float_digits".to_string(), "3".to_string())));

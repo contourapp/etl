@@ -53,7 +53,8 @@ pub fn build_error_handling_policy(error: &EtlError) -> ErrorHandlingPolicy {
         | ErrorKind::DestinationConnectionFailed
         | ErrorKind::DestinationAtomicBatchRetryable
         | ErrorKind::SourceDatabaseShutdown
-        | ErrorKind::SourceDatabaseInRecovery => {
+        | ErrorKind::SourceDatabaseInRecovery
+        | ErrorKind::SourceTransientFailure => {
             ErrorHandlingPolicy::new(RetryDirective::Timed, None)
         }
 
