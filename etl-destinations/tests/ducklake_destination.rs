@@ -189,6 +189,9 @@ fn count_applied_batches(conn: &Connection, table_name: &str, batch_kind: &str) 
     .expect("batch marker count query failed")
 }
 
+/// Counts watermark rows for one table. Note: progress writes are append-only,
+/// so this returns the number of CDC batches committed for the table since the
+/// last maintenance compaction pass — not necessarily 1.
 fn count_streaming_progress_rows(conn: &Connection, table_name: &str) -> i64 {
     conn.query_row(
         &format!(
@@ -203,10 +206,16 @@ fn count_streaming_progress_rows(conn: &Connection, table_name: &str) -> i64 {
     .expect("streaming progress count query failed")
 }
 
+/// Reads the latest watermark for one table, mirroring production's
+/// `read_table_streaming_progress` which orders by
+/// `(last_commit_lsn, last_tx_ordinal) DESC` and takes the first row.
 fn read_streaming_progress(conn: &Connection, table_name: &str) -> Option<(u64, u64)> {
     conn.query_row(
         &format!(
-            "SELECT last_commit_lsn, last_tx_ordinal FROM {}.{} WHERE table_name = {}",
+            "SELECT last_commit_lsn, last_tx_ordinal FROM {}.{} \
+             WHERE table_name = {} \
+             ORDER BY last_commit_lsn DESC, last_tx_ordinal DESC \
+             LIMIT 1",
             quote_identifier("lake"),
             quote_identifier("__etl_streaming_progress"),
             quote_literal(table_name),

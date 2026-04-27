@@ -984,6 +984,57 @@ async fn run_ducklake_maintenance_worker(
                         || state.latest_storage_metrics.is_some()
                 });
 
+                // Reclaim superseded watermark rows in `__etl_streaming_progress`.
+                // The append-only progress writes from `update_table_streaming_progress`
+                // grow this table linearly with apply commits; without compaction the
+                // inline portion eventually flushes to ever-growing parquet files. The
+                // DELETE puts the table in DuckLake's `tables_deleted_inlined` set,
+                // which would conflict with concurrent apply inserts; `try_write_owned`
+                // on the checkpoint gate excludes apply for the duration of the
+                // compaction commit. If apply is busy we skip this cycle and retry on
+                // the next flush_interval tick.
+                if let Ok(checkpoint_guard) = checkpoint_gate.clone().try_write_owned() {
+                    match pool.get_or_init_pool().await {
+                        Ok(maintenance_pool) => {
+                            let outcome = run_duckdb_blocking(
+                                maintenance_pool,
+                                Arc::clone(&blocking_slots),
+                                DuckDbBlockingOperationKind::Maintenance,
+                                move |conn| {
+                                    crate::ducklake::batches::compact_streaming_progress(conn)
+                                },
+                            )
+                            .await;
+                            drop(checkpoint_guard);
+                            match outcome {
+                                Ok(0) => {
+                                    debug!("ducklake streaming progress compaction noop");
+                                }
+                                Ok(rows_deleted) => {
+                                    debug!(
+                                        rows_deleted,
+                                        "ducklake streaming progress compaction completed"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        error = ?error,
+                                        "ducklake streaming progress compaction failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = ?error,
+                                "ducklake maintenance pool initialization failed"
+                            );
+                        }
+                    }
+                } else {
+                    debug!("ducklake streaming progress compaction skipped, apply in flight");
+                }
+
                 maybe_run_catalog_maintenance(
                     &mut pool,
                     Arc::clone(&checkpoint_gate),

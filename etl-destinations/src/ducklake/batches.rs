@@ -716,6 +716,60 @@ pub(super) fn clear_table_streaming_progress(
     Ok(())
 }
 
+/// Reclaims superseded watermark rows in `__etl_streaming_progress`.
+///
+/// Apply commits are append-only (see `update_table_streaming_progress`), so
+/// each table accumulates one watermark row per successful CDC batch. This
+/// function deletes any row for which a strictly newer
+/// `(last_commit_lsn, last_tx_ordinal)` exists for the same `table_name`,
+/// leaving exactly the latest watermark per table. The DELETE puts
+/// `__etl_streaming_progress` in DuckLake's `tables_deleted_inlined` set, which
+/// would conflict with concurrent apply inserts; callers must therefore hold
+/// the checkpoint gate's write lock while invoking this function so no apply
+/// transaction is in flight.
+pub(super) fn compact_streaming_progress(conn: &duckdb::Connection) -> EtlResult<u64> {
+    conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake BEGIN TRANSACTION failed",
+            source: error
+        )
+    })?;
+
+    let sql = format!(
+        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" AS sp1
+         WHERE EXISTS (
+             SELECT 1 FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" AS sp2
+             WHERE sp2.table_name = sp1.table_name
+             AND (sp2.last_commit_lsn, sp2.last_tx_ordinal)
+                 > (sp1.last_commit_lsn, sp1.last_tx_ordinal)
+         );"#
+    );
+
+    let deleted = match conn.execute(&sql, []) {
+        Ok(rows) => rows as u64,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake streaming progress compaction failed",
+                format_query_error_detail(&sql, &error),
+                source: error
+            ));
+        }
+    };
+
+    conn.execute_batch("COMMIT").map_err(|error| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake streaming progress compaction commit failed",
+            source: error
+        )
+    })?;
+
+    Ok(deleted)
+}
+
 /// Applies jitter to one DuckLake retry delay.
 fn jitter_ducklake_retry_delay(base_delay: Duration) -> Duration {
     let jitter_ratio = rand::rng().random_range(0.5..=1.5_f64);
@@ -745,6 +799,16 @@ fn record_replayed_batch_skip(batch: &PreparedDuckLakeTableBatch) {
 }
 
 /// Reads the steady-state streaming replay watermark for one table.
+///
+/// `__etl_streaming_progress` is append-only — every successful apply commit
+/// inserts a fresh watermark row rather than overwriting the previous one. This
+/// keeps the per-commit DuckLake transaction free of `DELETE`s on a shared
+/// catalog object, which would otherwise produce `Transaction conflict —
+/// another transaction has deleted inlined data from it` errors when multiple
+/// per-table apply tasks commit concurrently. The latest watermark per table is
+/// selected by ordering on `(last_commit_lsn, last_tx_ordinal) DESC` and taking
+/// the first row. Superseded rows are reclaimed by `compact_streaming_progress`
+/// running from the maintenance worker behind the checkpoint gate's write lock.
 fn read_table_streaming_progress(
     conn: &duckdb::Connection,
     table_name: &str,
@@ -752,7 +816,9 @@ fn read_table_streaming_progress(
     let sql = format!(
         r#"SELECT last_commit_lsn, last_tx_ordinal
          FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
-         WHERE table_name = {} LIMIT 1;"#,
+         WHERE table_name = {}
+         ORDER BY last_commit_lsn DESC, last_tx_ordinal DESC
+         LIMIT 1;"#,
         quote_literal(table_name),
     );
     let mut statement = conn.prepare(&sql).map_err(|error| {
@@ -1556,13 +1622,24 @@ fn update_table_streaming_progress(
             format!("table={}, batch_kind={}", batch.table_name, batch.batch_kind.as_str())
         )
     })?;
+    // Append-only: never DELETE from this table inside the apply transaction.
+    // DuckLake's OCC raises `Transaction conflict - another transaction has
+    // deleted inlined data from it` when concurrent transactions both touch
+    // the same inlined table's delete set, which is what the prior
+    // `DELETE WHERE table_name = X; INSERT ...` pattern produced under parallel
+    // per-table apply. Pure inserts to the same inlined table do not conflict
+    // (DuckLake's commit validator only rejects insert-into-table when another
+    // transaction dropped/altered/deleted-from/auto-flushed it; insert+insert
+    // is compatible — see `tables_inserted_inlined` in
+    // `ducklake_transaction.cpp`), so concurrent apply tasks can write fresh
+    // watermark rows without aborting. Superseded rows are reclaimed
+    // periodically by `compact_streaming_progress` in the maintenance worker,
+    // which holds the checkpoint gate's write lock so its DELETE does not race
+    // apply commits.
     let sql = format!(
-        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
-         WHERE table_name = {};
-         INSERT INTO {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
+        r#"INSERT INTO {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
          (table_name, last_commit_lsn, last_tx_ordinal, updated_at)
          VALUES ({}, {}, {}, current_timestamp);"#,
-        quote_literal(&batch.table_name),
         quote_literal(&batch.table_name),
         u64::from(last_sequence_key.commit_lsn),
         last_sequence_key.tx_ordinal,
