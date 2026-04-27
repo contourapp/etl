@@ -40,19 +40,24 @@ use crate::ducklake::{
 
 /// Dedicated pool size for background DuckLake maintenance work.
 const MAINTENANCE_POOL_SIZE: u32 = 1;
-/// Poll interval for checking per-table inline flush thresholds.
-const MAINTENANCE_FLUSH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Default poll interval for checking per-table inline flush thresholds. Used
+/// when [`DuckLakeDestination::new`] doesn't override via its
+/// `maintenance_flush_poll_interval` argument.
+pub(super) const MAINTENANCE_FLUSH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Fixed cadence for expiring old DuckLake snapshots.
 const MAINTENANCE_EXPIRE_SNAPSHOTS_INTERVAL: Duration = Duration::from_secs(5 * 60 * 60);
 /// Fixed cadence for cleaning up old DuckLake files.
 const MAINTENANCE_CLEANUP_OLD_FILES_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-/// Pending inlined bytes threshold that triggers a background inline flush.
-const MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD: u64 = 10_000_000;
+/// Default pending inlined bytes threshold that triggers a background inline
+/// flush. Used when [`DuckLakeDestination::new`] doesn't override via its
+/// `maintenance_inlined_data_bytes_threshold` argument.
+pub(super) const MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD: u64 = 10_000_000;
 /// Estimated ratio from raw row payload to compressed parquet bytes.
 const PARQUET_COMPRESSION_RATIO_ESTIMATE: u64 = 4;
-/// Fallback estimated pending bytes threshold when inline-size sampling is
-/// unavailable.
-const MAINTENANCE_PENDING_BYTES_THRESHOLD: u64 =
+/// Default fallback pending bytes threshold when inline-size sampling is
+/// unavailable. Used when [`DuckLakeDestination::new`] doesn't override via its
+/// `maintenance_pending_bytes_threshold` argument.
+pub(super) const MAINTENANCE_PENDING_BYTES_THRESHOLD: u64 =
     SMALL_FILE_SIZE_BYTES as u64 * PARQUET_COMPRESSION_RATIO_ESTIMATE;
 /// Optional pending inserted-rows threshold that triggers a background inline
 /// flush.
@@ -373,25 +378,37 @@ impl TableMaintenanceState {
         Some(sizes)
     }
 
-    /// Returns the primary reason that pending inlined work should be flushed.
-    fn flush_reason(&self, now: Instant) -> Option<MaintenanceReason> {
-        self.flush_reason_with_pending_rows_threshold(now, MAINTENANCE_PENDING_ROWS_THRESHOLD)
+    /// Returns the primary reason that pending inlined work should be flushed,
+    /// using the worker's configured thresholds.
+    fn flush_reason(
+        &self,
+        now: Instant,
+        inlined_data_bytes_threshold: u64,
+        pending_bytes_threshold: u64,
+    ) -> Option<MaintenanceReason> {
+        self.flush_reason_with_thresholds(
+            now,
+            inlined_data_bytes_threshold,
+            pending_bytes_threshold,
+            MAINTENANCE_PENDING_ROWS_THRESHOLD,
+        )
     }
 
     /// Returns the primary reason that pending inlined work should be flushed.
-    fn flush_reason_with_pending_rows_threshold(
+    fn flush_reason_with_thresholds(
         &self,
         _now: Instant,
+        inlined_data_bytes_threshold: u64,
+        pending_bytes_threshold: u64,
         pending_rows_threshold: Option<u64>,
     ) -> Option<MaintenanceReason> {
         if let Some(sizes) = self.current_pending_inline_data_sizes() {
             return (sizes.inlined_bytes
-                >= (MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD
-                    * PARQUET_COMPRESSION_RATIO_ESTIMATE))
+                >= (inlined_data_bytes_threshold * PARQUET_COMPRESSION_RATIO_ESTIMATE))
                 .then_some(MaintenanceReason::PendingInlinedDataBytesThreshold);
         }
 
-        if self.pending_bytes >= MAINTENANCE_PENDING_BYTES_THRESHOLD {
+        if self.pending_bytes >= pending_bytes_threshold {
             return Some(MaintenanceReason::PendingBytesThreshold);
         }
 
@@ -770,6 +787,7 @@ fn try_send_maintenance_notification(
 
 /// Starts warming the maintenance pool and spawns the periodic DuckLake worker.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_ducklake_maintenance_worker(
     manager: DuckLakeConnectionManager,
     checkpoint_gate: Arc<RwLock<()>>,
@@ -778,6 +796,9 @@ pub(super) fn spawn_ducklake_maintenance_worker(
     pending_inline_flush_requests: Arc<PendingInlineFlushRequests>,
     pending_inline_size_sampler: Option<DuckLakePendingInlineSizeSampler>,
     expire_snapshots_older_than: Arc<str>,
+    inlined_data_bytes_threshold: u64,
+    pending_bytes_threshold: u64,
+    flush_poll_interval: Duration,
 ) -> EtlResult<DuckLakeMaintenanceWorker> {
     let mut pool = LazyDuckLakePool::new(manager, MAINTENANCE_POOL_SIZE, "maintenance");
     pool.warm_in_background();
@@ -791,6 +812,9 @@ pub(super) fn spawn_ducklake_maintenance_worker(
         pending_inline_flush_requests,
         pending_inline_size_sampler,
         CatalogMaintenanceConfig::new(expire_snapshots_older_than),
+        inlined_data_bytes_threshold,
+        pending_bytes_threshold,
+        flush_poll_interval,
         notification_rx,
         shutdown_rx,
     ));
@@ -812,11 +836,14 @@ async fn run_ducklake_maintenance_worker(
     pending_inline_flush_requests: Arc<PendingInlineFlushRequests>,
     pending_inline_size_sampler: Option<DuckLakePendingInlineSizeSampler>,
     catalog_maintenance_config: CatalogMaintenanceConfig,
+    inlined_data_bytes_threshold: u64,
+    pending_bytes_threshold: u64,
+    flush_poll_interval: Duration,
     mut notification_rx: mpsc::Receiver<TableMaintenanceNotification>,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     let blocking_slots = pool.blocking_slots();
-    let mut flush_interval = tokio::time::interval(MAINTENANCE_FLUSH_POLL_INTERVAL);
+    let mut flush_interval = tokio::time::interval(flush_poll_interval);
     flush_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut table_states: HashMap<DuckLakeTableName, TableMaintenanceState> = HashMap::new();
@@ -859,7 +886,11 @@ async fn run_ducklake_maintenance_worker(
                     }
 
                     // If it needs to be flushed
-                    if let Some(reason) = table_state.flush_reason(now) {
+                    if let Some(reason) = table_state.flush_reason(
+                        now,
+                        inlined_data_bytes_threshold,
+                        pending_bytes_threshold,
+                    ) {
                         pending_inline_flush_requests.request(table_name.clone(), reason);
                         inline_flush_requested.store(true, AtomicOrdering::Release);
                     }
@@ -1856,7 +1887,12 @@ mod tests {
         state.record_write_activity(&write_activity(MAINTENANCE_PENDING_BYTES_THRESHOLD, 1), now);
 
         assert_eq!(
-            state.flush_reason_with_pending_rows_threshold(now, Some(1)),
+            state.flush_reason_with_thresholds(
+                now,
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                MAINTENANCE_PENDING_BYTES_THRESHOLD,
+                Some(1),
+            ),
             Some(MaintenanceReason::PendingBytesThreshold)
         );
     }
@@ -1875,7 +1911,11 @@ mod tests {
         );
 
         assert_eq!(
-            state.flush_reason(now + Duration::from_secs(2)),
+            state.flush_reason(
+                now + Duration::from_secs(2),
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                MAINTENANCE_PENDING_BYTES_THRESHOLD,
+            ),
             Some(MaintenanceReason::PendingInlinedDataBytesThreshold)
         );
     }
@@ -1892,7 +1932,14 @@ mod tests {
             },
         );
 
-        assert_eq!(state.flush_reason(now + Duration::from_secs(2)), None);
+        assert_eq!(
+            state.flush_reason(
+                now + Duration::from_secs(2),
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                MAINTENANCE_PENDING_BYTES_THRESHOLD,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1905,7 +1952,12 @@ mod tests {
         );
 
         assert_eq!(
-            state.flush_reason_with_pending_rows_threshold(now, Some(10_000)),
+            state.flush_reason_with_thresholds(
+                now,
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                MAINTENANCE_PENDING_BYTES_THRESHOLD,
+                Some(10_000),
+            ),
             Some(MaintenanceReason::PendingInsertedRowsThreshold)
         );
     }
@@ -2183,6 +2235,9 @@ mod tests {
             Arc::new(PendingInlineFlushRequests::default()),
             None,
             Arc::<str>::from("7 days"),
+            MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+            MAINTENANCE_PENDING_BYTES_THRESHOLD,
+            MAINTENANCE_FLUSH_POLL_INTERVAL,
         )
         .expect("failed to spawn maintenance worker");
 

@@ -23,8 +23,8 @@ use etl::{
     error::{ErrorKind, EtlResult},
     etl_error,
     types::{
-        Cell, EventSequenceKey, OldTableRow, PartialTableRow, ReplicatedTableSchema, SizeHint,
-        TableRow, UpdatedTableRow,
+        Cell, ColumnSchema, EventSequenceKey, OldTableRow, PartialTableRow, ReplicatedTableSchema,
+        SizeHint, TableRow, UpdatedTableRow,
     },
 };
 use metrics::{counter, histogram};
@@ -643,7 +643,13 @@ pub(super) fn prepare_copy_table_batch(
         first_sequence_key: None,
         last_sequence_key: None,
         action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
-            prepare_rows(table_rows, &table_schema.column_schemas),
+            prepare_rows(
+                table_rows,
+                &replicated_table_schema
+                    .column_schemas()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
         )]),
     })
 }
@@ -1005,6 +1011,8 @@ fn prepare_table_mutations(
     replicated_table_schema: &ReplicatedTableSchema,
     mutations: Vec<TableMutation>,
 ) -> EtlResult<Vec<PreparedTableMutation>> {
+    let column_schemas: Vec<ColumnSchema> =
+        replicated_table_schema.column_schemas().cloned().collect();
     let mut prepared_mutations = Vec::new();
     let mut upsert_rows = Vec::new();
     let mut delete_predicates = Vec::new();
@@ -1024,7 +1032,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
-                        &table_schema.column_schemas,
+                        &column_schemas,
                     )));
                 }
                 delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
@@ -1033,7 +1041,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
-                        &table_schema.column_schemas,
+                        &column_schemas,
                     )));
                 }
                 if !delete_predicates.is_empty() {
@@ -1052,7 +1060,10 @@ fn prepare_table_mutations(
                             origin: "update",
                         });
                         prepared_mutations
-                            .push(PreparedTableMutation::Upsert(prepare_rows(vec![upsert_row])));
+                            .push(PreparedTableMutation::Upsert(prepare_rows(
+                                vec![upsert_row],
+                                &column_schemas,
+                            )));
                     }
                     UpdatedTableRow::Partial(partial_row) => {
                         prepared_mutations.push(PreparedTableMutation::Update {
@@ -1072,7 +1083,7 @@ fn prepare_table_mutations(
                 if !upsert_rows.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                         std::mem::take(&mut upsert_rows),
-                        &table_schema.column_schemas,
+                        &column_schemas,
                     )));
                 }
                 if !delete_predicates.is_empty() {
@@ -1088,7 +1099,7 @@ fn prepare_table_mutations(
                 });
                 prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
                     vec![row],
-                    &table_schema.column_schemas,
+                    &column_schemas,
                 )));
             }
         }
@@ -1097,7 +1108,7 @@ fn prepare_table_mutations(
     if !upsert_rows.is_empty() {
         prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
             upsert_rows,
-            &table_schema.column_schemas,
+            &column_schemas,
         )));
     }
     if !delete_predicates.is_empty() {

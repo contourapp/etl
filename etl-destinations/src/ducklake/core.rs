@@ -1,6 +1,5 @@
 #[cfg(feature = "test-utils")]
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
@@ -61,9 +60,11 @@ use crate::{
         },
         inline_size::DuckLakePendingInlineSizeSampler,
         maintenance::{
-            DuckLakeMaintenanceWorker, PendingInlineFlushRequests, TableMaintenanceNotification,
-            TableWriteActivity, send_maintenance_notification, spawn_ducklake_maintenance_worker,
-            table_write_slot,
+            DuckLakeMaintenanceWorker, MAINTENANCE_FLUSH_POLL_INTERVAL,
+            MAINTENANCE_PENDING_BYTES_THRESHOLD,
+            MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD, PendingInlineFlushRequests,
+            TableMaintenanceNotification, TableWriteActivity, send_maintenance_notification,
+            spawn_ducklake_maintenance_worker, table_write_slot,
         },
         metrics::{
             DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE, register_metrics,
@@ -391,6 +392,25 @@ where
     ///   `target_file_size` value (e.g. `"10MB"`). Defaults to `10MB`.
     /// - `expire_snapshots_older_than`: Optional DuckLake snapshot-retention
     ///   interval (e.g. `"7 days"`). Defaults to `7 days`.
+    /// - `maintenance_inlined_data_bytes_threshold`: Optional pending inline
+    ///   insert-data byte threshold above which the background maintenance
+    ///   worker triggers a flush of inlined data into Parquet files. Higher
+    ///   values reduce the chance of conflict with apply-worker commits during
+    ///   high-throughput catch-up; lower values keep the catalog smaller. When
+    ///   unset, defaults to [`MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD`].
+    /// - `maintenance_pending_bytes_threshold`: Optional fallback pending bytes
+    ///   threshold used when the inline-size sampler doesn't have a fresh
+    ///   sample. The maintenance worker estimates pending inline data from
+    ///   observed write activity since the last flush; once the estimate exceeds
+    ///   this threshold, a flush fires even without a fresh sampler reading.
+    ///   Pair this with a high `maintenance_inlined_data_bytes_threshold` to
+    ///   fully suppress maintenance during catch-up. When unset, defaults to
+    ///   [`MAINTENANCE_PENDING_BYTES_THRESHOLD`].
+    /// - `maintenance_flush_poll_interval`: Optional how often the maintenance
+    ///   worker wakes up to evaluate whether any table needs a flush. Increasing
+    ///   this (e.g. from 30s to 5min) reduces how often maintenance writes can
+    ///   race apply-worker commits. When unset, defaults to
+    ///   [`MAINTENANCE_FLUSH_POLL_INTERVAL`].
     /// - `duckdb_log`: Optional DuckDB log storage and shutdown dump paths.
     /// - On Linux and macOS, DuckDB extensions are loaded from vendored local
     ///   files when a vendored directory is available. The root directory can
@@ -411,6 +431,9 @@ where
         duckdb_memory_cache_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
+        maintenance_inlined_data_bytes_threshold: Option<u64>,
+        maintenance_pending_bytes_threshold: Option<u64>,
+        maintenance_flush_poll_interval: Option<Duration>,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
@@ -440,6 +463,12 @@ where
         let expire_snapshots_older_than = Arc::<str>::from(
             resolve_expire_snapshots_older_than(expire_snapshots_older_than.as_deref()).to_owned(),
         );
+        let maintenance_inlined_data_bytes_threshold = maintenance_inlined_data_bytes_threshold
+            .unwrap_or(MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD);
+        let maintenance_pending_bytes_threshold =
+            maintenance_pending_bytes_threshold.unwrap_or(MAINTENANCE_PENDING_BYTES_THRESHOLD);
+        let maintenance_flush_poll_interval =
+            maintenance_flush_poll_interval.unwrap_or(MAINTENANCE_FLUSH_POLL_INTERVAL);
         if let crate::ducklake::config::DuckDbExtensionStrategy::VendoredLocal { platform_dir } =
             extension_strategy
         {
@@ -570,6 +599,9 @@ where
                 Arc::clone(&inline_flush_requests),
                 pending_inline_size_sampler,
                 Arc::clone(&expire_snapshots_older_than),
+                maintenance_inlined_data_bytes_threshold,
+                maintenance_pending_bytes_threshold,
+                maintenance_flush_poll_interval,
             )?
             .into(),
         );
