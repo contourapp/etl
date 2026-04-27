@@ -720,13 +720,19 @@ pub(super) fn clear_table_streaming_progress(
 ///
 /// Apply commits are append-only (see `update_table_streaming_progress`), so
 /// each table accumulates one watermark row per successful CDC batch. This
-/// function deletes any row for which a strictly newer
-/// `(last_commit_lsn, last_tx_ordinal)` exists for the same `table_name`,
-/// leaving exactly the latest watermark per table. The DELETE puts
+/// function keeps only the row with the highest
+/// `(last_commit_lsn, last_tx_ordinal)` per `table_name`. The DELETE puts
 /// `__etl_streaming_progress` in DuckLake's `tables_deleted_inlined` set, which
 /// would conflict with concurrent apply inserts; callers must therefore hold
 /// the checkpoint gate's write lock while invoking this function so no apply
 /// transaction is in flight.
+///
+/// The SQL uses a window function (`QUALIFY ROW_NUMBER`) to identify rows that
+/// are not the latest watermark for their table, then deletes them by rowid.
+/// This is O(n log n) on a single sort+partition pass — much faster than the
+/// O(n²) correlated `EXISTS` self-join we tried first, which blew through
+/// `MAINTENANCE_QUERY_TIMEOUT` once the table accumulated even a few thousand
+/// rows.
 pub(super) fn compact_streaming_progress(conn: &duckdb::Connection) -> EtlResult<u64> {
     conn.execute_batch("BEGIN TRANSACTION").map_err(|error| {
         etl_error!(
@@ -737,12 +743,13 @@ pub(super) fn compact_streaming_progress(conn: &duckdb::Connection) -> EtlResult
     })?;
 
     let sql = format!(
-        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" AS sp1
-         WHERE EXISTS (
-             SELECT 1 FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" AS sp2
-             WHERE sp2.table_name = sp1.table_name
-             AND (sp2.last_commit_lsn, sp2.last_tx_ordinal)
-                 > (sp1.last_commit_lsn, sp1.last_tx_ordinal)
+        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
+         WHERE rowid IN (
+             SELECT rowid FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
+             QUALIFY ROW_NUMBER() OVER (
+                 PARTITION BY table_name
+                 ORDER BY last_commit_lsn DESC, last_tx_ordinal DESC
+             ) > 1
          );"#
     );
 
