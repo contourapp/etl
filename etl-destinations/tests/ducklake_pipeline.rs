@@ -139,7 +139,9 @@ async fn build_destination(
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .expect("failed to create DuckLake destination");

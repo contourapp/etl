@@ -318,7 +318,9 @@ async fn test_write_table_rows_basic() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -379,7 +381,9 @@ async fn test_write_table_rows_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -422,7 +426,9 @@ async fn test_ducklake_rejects_zero_pool_size() {
         None,
         None,
         None,
-        MemoryStore::new(),
+        MemoryStore::new(),    None,
+    None,
+
     )
     .await
     .err()
@@ -462,7 +468,9 @@ async fn test_write_table_rows_reuses_warm_pooled_connection() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -528,7 +536,9 @@ async fn test_write_table_rows_replaces_broken_pooled_connection_after_retry() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -597,7 +607,9 @@ async fn test_write_table_rows_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -649,7 +661,9 @@ async fn test_concurrent_same_table_copy_batches_complete() {
             None,
             None,
             None,
-            store,
+            store,        None,
+        None,
+
         )
         .await
         .unwrap(),
@@ -725,7 +739,9 @@ async fn test_write_table_rows_empty_creates_table() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -769,7 +785,9 @@ async fn test_truncate_clears_rows() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -843,7 +861,9 @@ async fn test_truncate_clears_copy_markers_for_recopy() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -894,7 +914,9 @@ async fn test_write_events() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -990,7 +1012,9 @@ async fn test_trait_write_events_dispatches_asynchronously_for_ducklake() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1080,7 +1104,9 @@ async fn test_write_events_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1137,7 +1163,9 @@ async fn test_write_events_with_old_row_update() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1214,7 +1242,9 @@ async fn test_write_events_replay_is_idempotent() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1310,7 +1340,9 @@ async fn test_write_events_same_commit_lsn_higher_tx_ordinal_still_applies() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1388,7 +1420,9 @@ async fn test_write_events_restart_overlap_rebatches_only_pending_suffix() {
         None,
         None,
         None,
-        store.clone(),
+        store.clone(),    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1426,7 +1460,9 @@ async fn test_write_events_restart_overlap_rebatches_only_pending_suffix() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1506,7 +1542,9 @@ async fn test_write_events_reuses_one_staging_table_per_atomic_batch() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1596,7 +1634,9 @@ async fn test_applied_batches_table_uses_data_inlining() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1645,7 +1685,9 @@ async fn test_shutdown_flushes_inlined_copy_rows() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1726,7 +1768,9 @@ async fn test_shutdown_flushes_inlined_cdc_rows_for_all_known_tables() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1835,7 +1879,9 @@ async fn test_write_events_mixed_multi_table_batches() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -1969,7 +2015,9 @@ async fn test_write_events_truncate_retry_after_post_commit_failure_is_idempoten
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -2067,7 +2115,9 @@ async fn test_write_events_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();
@@ -2170,7 +2220,9 @@ async fn test_concurrent_writes_with_single_slot_complete() {
             None,
             None,
             None,
-            store,
+            store,        None,
+        None,
+
         )
         .await
         .unwrap(),
@@ -2232,7 +2284,9 @@ async fn test_type_mapping_round_trip() {
         None,
         None,
         None,
-        store,
+        store,    None,
+    None,
+
     )
     .await
     .unwrap();

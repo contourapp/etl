@@ -3,7 +3,6 @@ use std::sync::Arc;
 #[cfg(feature = "test-utils")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
 use std::time::Duration;
 
 use etl::destination::Destination;
@@ -48,11 +47,11 @@ use crate::ducklake::config::{
 };
 use crate::ducklake::inline_size::DuckLakePendingInlineSizeSampler;
 use crate::ducklake::maintenance::{
-    DuckLakeMaintenanceWorker, ENABLE_CHECKPOINT_MAINTENANCE,
-    MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD, PendingInlineFlushRequests,
-    TableMaintenanceNotification, TableWriteActivity, maybe_run_requested_checkpoint,
-    maybe_run_requested_merge_adjacent_files, send_maintenance_notification,
-    spawn_ducklake_maintenance_worker, table_write_slot,
+    DuckLakeMaintenanceWorker, ENABLE_CHECKPOINT_MAINTENANCE, MAINTENANCE_FLUSH_POLL_INTERVAL,
+    MAINTENANCE_PENDING_BYTES_THRESHOLD, MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+    PendingInlineFlushRequests, TableMaintenanceNotification, TableWriteActivity,
+    maybe_run_requested_checkpoint, maybe_run_requested_merge_adjacent_files,
+    send_maintenance_notification, spawn_ducklake_maintenance_worker, table_write_slot,
 };
 use crate::ducklake::metrics::{
     DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE, register_metrics,
@@ -236,6 +235,18 @@ where
     ///   values reduce the chance of conflict with apply-worker commits during
     ///   high-throughput catch-up; lower values keep the catalog smaller. When
     ///   unset, defaults to [`MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD`].
+    /// - `maintenance_pending_bytes_threshold`: Optional fallback pending bytes
+    ///   threshold used when the inline-size sampler doesn't have a fresh sample.
+    ///   The maintenance worker estimates pending inline data from observed write
+    ///   activity since the last flush; once the estimate exceeds this threshold,
+    ///   a flush fires even without a fresh sampler reading. Pair this with a high
+    ///   `maintenance_inlined_data_bytes_threshold` to fully suppress maintenance
+    ///   during catch-up. When unset, defaults to [`MAINTENANCE_PENDING_BYTES_THRESHOLD`].
+    /// - `maintenance_flush_poll_interval`: Optional how often the maintenance
+    ///   worker wakes up to evaluate whether any table needs a flush. Increasing
+    ///   this (e.g. from 30s to 5min) reduces how often maintenance writes can
+    ///   race apply-worker commits. When unset, defaults to
+    ///   [`MAINTENANCE_FLUSH_POLL_INTERVAL`].
     /// - `duckdb_log`: Optional DuckDB log storage and shutdown dump paths.
     /// - On Linux and macOS, DuckDB extensions are loaded from vendored local
     ///   files when a vendored directory is available. The root directory can
@@ -256,6 +267,8 @@ where
         duckdb_memory_cache_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
         maintenance_inlined_data_bytes_threshold: Option<u64>,
+        maintenance_pending_bytes_threshold: Option<u64>,
+        maintenance_flush_poll_interval: Option<Duration>,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
@@ -276,6 +289,10 @@ where
         );
         let maintenance_inlined_data_bytes_threshold = maintenance_inlined_data_bytes_threshold
             .unwrap_or(MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD);
+        let maintenance_pending_bytes_threshold =
+            maintenance_pending_bytes_threshold.unwrap_or(MAINTENANCE_PENDING_BYTES_THRESHOLD);
+        let maintenance_flush_poll_interval =
+            maintenance_flush_poll_interval.unwrap_or(MAINTENANCE_FLUSH_POLL_INTERVAL);
         if let crate::ducklake::config::DuckDbExtensionStrategy::VendoredLocal { platform_dir } =
             extension_strategy
         {
@@ -376,6 +393,8 @@ where
                 Arc::clone(&merge_adjacent_files_dirty),
                 Arc::clone(&maintenance_target_file_size),
                 maintenance_inlined_data_bytes_threshold,
+                maintenance_pending_bytes_threshold,
+                maintenance_flush_poll_interval,
                 pending_inline_size_sampler,
             )?
             .into(),
@@ -1364,7 +1383,9 @@ mod tests {
             None,
             None,
             None,
-            store,
+            store,        None,
+        None,
+
         )
         .await
         .expect("failed to create destination");
@@ -1426,7 +1447,9 @@ mod tests {
             None,
             None,
             None,
-            store,
+            store,        None,
+        None,
+
         )
         .await
         .expect("failed to create destination");
@@ -1485,7 +1508,9 @@ mod tests {
             None,
             None,
             None,
-            store,
+            store,        None,
+        None,
+
         )
         .await
         .expect("failed to create destination");
