@@ -191,6 +191,9 @@ pub(crate) async fn start_replicator_with_config(
                 duckdb_memory_cache_limit.clone(),
                 maintenance_target_file_size.clone(),
                 expire_snapshots_older_than.clone(),
+                None,
+                None,
+                None,
                 state_store.clone(),
             )
             .await?;

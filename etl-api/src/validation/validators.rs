@@ -747,6 +747,9 @@ impl Validator for DucklakeValidator {
             self.duckdb_memory_cache_limit.clone(),
             self.maintenance_target_file_size.clone(),
             self.expire_snapshots_older_than.clone(),
+            None,
+            None,
+            None,
             MemoryStore::new(),
         )
         .await
