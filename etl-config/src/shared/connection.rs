@@ -70,17 +70,21 @@ pub static ETL_MIGRATION_OPTIONS: LazyLock<PgConnectionOptions> =
 
 /// Connection options for logical replication streams.
 ///
-/// Disables statement, lock, idle, and walsender timeouts to allow large COPY operations
+/// Disables statement, lock, and idle timeouts to allow large COPY operations
 /// and long-running transactions during initial table synchronization and WAL streaming.
 ///
 /// Lock timeout is disabled because `CREATE_REPLICATION_SLOT` must wait for all in-progress
 /// write transactions to reach a consistent snapshot point. On heavily-loaded databases this
 /// can take minutes, and a timeout would only cause retries that will also fail.
 ///
-/// `wal_sender_timeout` is disabled because catch-up reads on managed Postgres providers
-/// (Neon, etc.) can fault to cold-tier storage and individually take well over the default
-/// 60s send window. A walsender timeout there cascades to a slot-disconnect, retained-WAL
-/// growth, and eventual slot invalidation.
+/// `wal_sender_timeout` is set to 30 minutes — long enough that catch-up reads on managed
+/// Postgres providers (Neon, etc.) faulting to cold-tier storage will complete within the
+/// window, but short enough that PG can detect dead replication clients and release stuck
+/// slots. Setting this to `0` (disabled) was tried previously, but it removes PG's only
+/// mechanism for noticing dead walsender processes — leaving slot `active_pid` permanently
+/// stale after every runtime crash/restart and requiring manual Neon compute restarts to
+/// recover. 30min keeps zombie lifetime bounded while still tolerating the Neon cold-tier
+/// fetch tail.
 pub static ETL_REPLICATION_OPTIONS: LazyLock<PgConnectionOptions> =
     LazyLock::new(|| PgConnectionOptions {
         datestyle: COMMON_DATESTYLE.to_string(),
@@ -92,7 +96,7 @@ pub static ETL_REPLICATION_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 0,
         idle_in_transaction_session_timeout: 0,
         application_name: APP_NAME_REPLICATOR_STREAMING.to_string(),
-        wal_sender_timeout: 0,
+        wal_sender_timeout: 1_800_000,
     });
 
 /// Connection options for accessing ETL state metadata in the source database.
@@ -140,8 +144,11 @@ pub struct PgConnectionOptions {
     /// Maximum time in milliseconds the walsender process waits to send WAL pages
     /// before terminating the connection. `0` disables the timeout.
     /// Only meaningful for replication connections; ignored by non-walsender backends.
-    /// Set to `0` for streaming workloads to survive cold-storage WAL fetches that
-    /// can exceed Postgres's 60-second default.
+    /// Replication connections set this to a generous value (e.g. 30 minutes) — large
+    /// enough to survive cold-storage WAL fetches but small enough that PG can detect
+    /// and release dead replication slots. `0` is unsafe for production: it leaks
+    /// `active_pid` shared-memory state on every crash, requiring manual compute
+    /// restarts to recover the slot.
     pub wal_sender_timeout: u32,
 }
 
@@ -432,7 +439,7 @@ mod tests {
 
         assert_eq!(
             options_string,
-            "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3 -c client_encoding=UTF8 -c timezone=UTC -c statement_timeout=0 -c lock_timeout=0 -c idle_in_transaction_session_timeout=0 -c application_name=supabase_etl_replicator_streaming -c wal_sender_timeout=0"
+            "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3 -c client_encoding=UTF8 -c timezone=UTC -c statement_timeout=0 -c lock_timeout=0 -c idle_in_transaction_session_timeout=0 -c application_name=supabase_etl_replicator_streaming -c wal_sender_timeout=1800000"
         );
     }
 
