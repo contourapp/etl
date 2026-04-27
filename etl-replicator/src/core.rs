@@ -179,6 +179,7 @@ pub async fn start_replicator_with_config(
                 metadata_schema.clone(),
                 duckdb_memory_cache_limit.clone(),
                 maintenance_target_file_size.clone(),
+                None,
                 state_store.clone(),
             )
             .await?;

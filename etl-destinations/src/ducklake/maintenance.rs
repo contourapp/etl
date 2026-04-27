@@ -34,8 +34,9 @@ use crate::ducklake::{DuckLakeTableName, LAKE_CATALOG};
 const MAINTENANCE_POOL_SIZE: u32 = 1;
 /// Poll interval for checking per-table inline flush thresholds.
 const MAINTENANCE_FLUSH_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Pending inline insert-data bytes threshold that triggers a background inline flush.
-const MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD: u64 = 10_000_000;
+/// Default pending inline insert-data bytes threshold that triggers a background inline flush.
+/// Used when a caller doesn't override the threshold via [`DuckLakeDestination::new`].
+pub(super) const MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD: u64 = 10_000_000;
 /// Estimated ratio from raw row payload to compressed parquet bytes.
 const PARQUET_COMPRESSION_RATIO_ESTIMATE: u64 = 4;
 /// Fallback estimated pending bytes threshold when inline-size sampling is unavailable.
@@ -326,18 +327,23 @@ impl TableMaintenanceState {
     }
 
     /// Returns the primary reason that pending inlined work should be flushed.
-    fn flush_reason(&self, now: Instant) -> Option<MaintenanceReason> {
-        self.flush_reason_with_pending_rows_threshold(now, MAINTENANCE_PENDING_ROWS_THRESHOLD)
+    fn flush_reason(&self, now: Instant, inlined_bytes_threshold: u64) -> Option<MaintenanceReason> {
+        self.flush_reason_with_thresholds(
+            now,
+            inlined_bytes_threshold,
+            MAINTENANCE_PENDING_ROWS_THRESHOLD,
+        )
     }
 
     /// Returns the primary reason that pending inlined work should be flushed.
-    fn flush_reason_with_pending_rows_threshold(
+    fn flush_reason_with_thresholds(
         &self,
         _now: Instant,
+        inlined_bytes_threshold: u64,
         pending_rows_threshold: Option<u64>,
     ) -> Option<MaintenanceReason> {
         if let Some(sizes) = self.current_pending_inline_data_sizes() {
-            return (sizes.inlined_data_bytes >= MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD)
+            return (sizes.inlined_data_bytes >= inlined_bytes_threshold)
                 .then_some(MaintenanceReason::PendingInlinedDataBytesThreshold);
         }
 
@@ -763,6 +769,7 @@ pub(super) fn spawn_ducklake_maintenance_worker(
     merge_adjacent_files_requested: Arc<AtomicBool>,
     merge_adjacent_files_dirty: Arc<AtomicBool>,
     maintenance_target_file_size: Arc<str>,
+    inlined_data_bytes_threshold: u64,
     pending_inline_size_sampler: Option<DuckLakePendingInlineSizeSampler>,
 ) -> EtlResult<DuckLakeMaintenanceWorker> {
     let mut pool = LazyDuckLakePool::new(manager, MAINTENANCE_POOL_SIZE, "maintenance");
@@ -779,6 +786,7 @@ pub(super) fn spawn_ducklake_maintenance_worker(
         merge_adjacent_files_requested,
         merge_adjacent_files_dirty,
         maintenance_target_file_size,
+        inlined_data_bytes_threshold,
         pending_inline_size_sampler,
         notification_rx,
         shutdown_rx,
@@ -803,6 +811,7 @@ async fn run_ducklake_maintenance_worker(
     merge_adjacent_files_requested: Arc<AtomicBool>,
     merge_adjacent_files_dirty: Arc<AtomicBool>,
     maintenance_target_file_size: Arc<str>,
+    inlined_data_bytes_threshold: u64,
     pending_inline_size_sampler: Option<DuckLakePendingInlineSizeSampler>,
     mut notification_rx: mpsc::Receiver<TableMaintenanceNotification>,
     mut shutdown_rx: watch::Receiver<()>,
@@ -888,7 +897,9 @@ async fn run_ducklake_maintenance_worker(
                     }
 
                     // If it needs to be flushed
-                    if let Some(reason) = table_state.flush_reason(now) {
+                    if let Some(reason) =
+                        table_state.flush_reason(now, inlined_data_bytes_threshold)
+                    {
                         pending_inline_flush_requests.request(table_name.clone(), reason);
                         inline_flush_requested.store(true, AtomicOrdering::Release);
                     }
@@ -2076,7 +2087,11 @@ mod tests {
         state.record_write_activity(&write_activity(MAINTENANCE_PENDING_BYTES_THRESHOLD, 1), now);
 
         assert_eq!(
-            state.flush_reason_with_pending_rows_threshold(now, Some(1)),
+            state.flush_reason_with_thresholds(
+                now,
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                Some(1),
+            ),
             Some(MaintenanceReason::PendingBytesThreshold)
         );
     }
@@ -2094,7 +2109,10 @@ mod tests {
         );
 
         assert_eq!(
-            state.flush_reason(now + Duration::from_secs(2)),
+            state.flush_reason(
+                now + Duration::from_secs(2),
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+            ),
             Some(MaintenanceReason::PendingInlinedDataBytesThreshold)
         );
     }
@@ -2111,7 +2129,13 @@ mod tests {
             },
         );
 
-        assert_eq!(state.flush_reason(now + Duration::from_secs(2)), None);
+        assert_eq!(
+            state.flush_reason(
+                now + Duration::from_secs(2),
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2123,7 +2147,10 @@ mod tests {
             now,
         );
 
-        assert_eq!(state.flush_reason(now), None);
+        assert_eq!(
+            state.flush_reason(now, MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD),
+            None
+        );
     }
 
     #[test]
@@ -2136,7 +2163,11 @@ mod tests {
         );
 
         assert_eq!(
-            state.flush_reason_with_pending_rows_threshold(now, Some(10_000)),
+            state.flush_reason_with_thresholds(
+                now,
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+                Some(10_000),
+            ),
             Some(MaintenanceReason::PendingInsertedRowsThreshold)
         );
     }
@@ -2147,7 +2178,13 @@ mod tests {
         let mut state = TableMaintenanceState::default();
         state.record_write_activity(&write_activity(128, 1), now);
 
-        assert_eq!(state.flush_reason(now + Duration::from_secs(60 * 10)), None);
+        assert_eq!(
+            state.flush_reason(
+                now + Duration::from_secs(60 * 10),
+                MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD,
+            ),
+            None
+        );
     }
 
     #[test]

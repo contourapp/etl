@@ -48,7 +48,8 @@ use crate::ducklake::config::{
 };
 use crate::ducklake::inline_size::DuckLakePendingInlineSizeSampler;
 use crate::ducklake::maintenance::{
-    DuckLakeMaintenanceWorker, ENABLE_CHECKPOINT_MAINTENANCE, PendingInlineFlushRequests,
+    DuckLakeMaintenanceWorker, ENABLE_CHECKPOINT_MAINTENANCE,
+    MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD, PendingInlineFlushRequests,
     TableMaintenanceNotification, TableWriteActivity, maybe_run_requested_checkpoint,
     maybe_run_requested_merge_adjacent_files, send_maintenance_notification,
     spawn_ducklake_maintenance_worker, table_write_slot,
@@ -229,6 +230,12 @@ where
     ///   (e.g. `"50MB"`). Defaults to `50MB`.
     /// - `maintenance_target_file_size`: Optional DuckLake maintenance
     ///   `target_file_size` value (e.g. `"10MB"`). Defaults to `10MB`.
+    /// - `maintenance_inlined_data_bytes_threshold`: Optional pending inline
+    ///   insert-data byte threshold above which the background maintenance
+    ///   worker triggers a flush of inlined data into Parquet files. Higher
+    ///   values reduce the chance of conflict with apply-worker commits during
+    ///   high-throughput catch-up; lower values keep the catalog smaller. When
+    ///   unset, defaults to [`MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD`].
     /// - `duckdb_log`: Optional DuckDB log storage and shutdown dump paths.
     /// - On Linux and macOS, DuckDB extensions are loaded from vendored local
     ///   files when a vendored directory is available. The root directory can
@@ -248,6 +255,7 @@ where
         metadata_schema: Option<String>,
         duckdb_memory_cache_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
+        maintenance_inlined_data_bytes_threshold: Option<u64>,
         store: S,
     ) -> EtlResult<Self> {
         register_metrics();
@@ -266,6 +274,8 @@ where
             maintenance_target_file_size
                 .unwrap_or_else(|| MAINTENANCE_TARGET_FILE_SIZE.to_string()),
         );
+        let maintenance_inlined_data_bytes_threshold = maintenance_inlined_data_bytes_threshold
+            .unwrap_or(MAINTENANCE_PENDING_INLINED_DATA_BYTES_THRESHOLD);
         if let crate::ducklake::config::DuckDbExtensionStrategy::VendoredLocal { platform_dir } =
             extension_strategy
         {
@@ -365,6 +375,7 @@ where
                 Arc::clone(&merge_adjacent_files_requested),
                 Arc::clone(&merge_adjacent_files_dirty),
                 Arc::clone(&maintenance_target_file_size),
+                maintenance_inlined_data_bytes_threshold,
                 pending_inline_size_sampler,
             )?
             .into(),
@@ -1352,6 +1363,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             store,
         )
         .await
@@ -1413,6 +1425,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             store,
         )
         .await
@@ -1467,6 +1480,7 @@ mod tests {
             catalog.clone(),
             data.clone(),
             1,
+            None,
             None,
             None,
             None,

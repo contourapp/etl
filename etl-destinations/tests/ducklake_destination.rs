@@ -317,6 +317,7 @@ async fn test_write_table_rows_basic() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -377,6 +378,7 @@ async fn test_write_table_rows_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -419,6 +421,7 @@ async fn test_ducklake_rejects_zero_pool_size() {
         None,
         None,
         None,
+        None,
         MemoryStore::new(),
     )
     .await
@@ -454,6 +457,7 @@ async fn test_write_table_rows_reuses_warm_pooled_connection() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -519,6 +523,7 @@ async fn test_write_table_rows_replaces_broken_pooled_connection_after_retry() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -591,6 +596,7 @@ async fn test_write_table_rows_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -638,6 +644,7 @@ async fn test_concurrent_same_table_copy_batches_complete() {
             catalog_url.clone(),
             data_url.clone(),
             1,
+            None,
             None,
             None,
             None,
@@ -717,6 +724,7 @@ async fn test_write_table_rows_empty_creates_table() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -756,6 +764,7 @@ async fn test_truncate_clears_rows() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -833,6 +842,7 @@ async fn test_truncate_clears_copy_markers_for_recopy() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -879,6 +889,7 @@ async fn test_write_events() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -978,6 +989,7 @@ async fn test_trait_write_events_dispatches_asynchronously_for_ducklake() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -1067,6 +1079,7 @@ async fn test_write_events_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -1119,6 +1132,7 @@ async fn test_write_events_with_old_row_update() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1195,6 +1209,7 @@ async fn test_write_events_replay_is_idempotent() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1294,6 +1309,7 @@ async fn test_write_events_same_commit_lsn_higher_tx_ordinal_still_applies() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -1371,6 +1387,7 @@ async fn test_write_events_restart_overlap_rebatches_only_pending_suffix() {
         None,
         None,
         None,
+        None,
         store.clone(),
     )
     .await
@@ -1404,6 +1421,7 @@ async fn test_write_events_restart_overlap_rebatches_only_pending_suffix() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1483,6 +1501,7 @@ async fn test_write_events_reuses_one_staging_table_per_atomic_batch() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1576,6 +1595,7 @@ async fn test_applied_batches_table_uses_data_inlining() {
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -1620,6 +1640,7 @@ async fn test_shutdown_flushes_inlined_copy_rows() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1700,6 +1721,7 @@ async fn test_shutdown_flushes_inlined_cdc_rows_for_all_known_tables() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1808,6 +1830,7 @@ async fn test_write_events_mixed_multi_table_batches() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -1945,6 +1968,7 @@ async fn test_write_events_truncate_retry_after_post_commit_failure_is_idempoten
         None,
         None,
         None,
+        None,
         store,
     )
     .await
@@ -2038,6 +2062,7 @@ async fn test_write_events_retry_after_post_commit_failure_is_idempotent() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
@@ -2144,6 +2169,7 @@ async fn test_concurrent_writes_with_single_slot_complete() {
             None,
             None,
             None,
+            None,
             store,
         )
         .await
@@ -2201,6 +2227,7 @@ async fn test_type_mapping_round_trip() {
         catalog_url.clone(),
         data_url.clone(),
         1,
+        None,
         None,
         None,
         None,
