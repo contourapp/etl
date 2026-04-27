@@ -109,8 +109,8 @@ fn pending_inline_data_bytes_query(metadata_schema: &str) -> String {
              ) AS total_bytes
          )
          SELECT
-             (SELECT total_bytes FROM inline_data_bytes)
-             + (SELECT total_bytes FROM inline_delete_bytes);"
+             ((SELECT total_bytes FROM inline_data_bytes)
+              + (SELECT total_bytes FROM inline_delete_bytes))::bigint;"
     )
 }
 
