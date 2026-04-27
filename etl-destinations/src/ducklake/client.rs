@@ -40,8 +40,12 @@ static POSTGRES_PASSWORD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("postgres password redaction regex should compile")
 });
 
-/// Timeout applied to each foreground DuckLake blocking operation.
-pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// Timeout applied to each foreground DuckLake blocking operation. 10 minutes
+/// (vs the upstream default of 2) so a single COPY against a large table on
+/// catch-up doesn't trip the per-operation timeout: COPYing tens of millions of
+/// rows from a Neon-hosted source can take several minutes, and the cost of a
+/// false-positive timeout is a full retry of the COPY transaction.
+pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Timeout applied to each maintenance DuckLake blocking operation.
 pub(super) const MAINTENANCE_QUERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
