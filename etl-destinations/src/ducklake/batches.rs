@@ -105,17 +105,18 @@ pub(super) enum TableMutation {
 enum PreparedTableMutation {
     Upsert(PreparedRows),
     Delete {
-        // For WHERE clause predicates used in DELETE statements.
         predicates: Vec<String>,
-        // To know if it's coming from an update or delete operation.
         origin: &'static str,
     },
     Update {
-        // For SET clause assignments used in UPDATE statements. Example: "value=1, id=3"
         assignments: Vec<String>,
-        // For the WHERE clause predicate used in the UPDATE statement. Example: "id = 4 AND
-        // content = 'hello'"
         predicate: String,
+    },
+    /// MERGE INTO: single-scan upsert via staging table join.
+    Merge {
+        rows: PreparedRows,
+        identity_columns: Vec<String>,
+        all_columns: Vec<String>,
     },
 }
 
@@ -1083,9 +1084,18 @@ fn prepare_table_mutations(
 ) -> EtlResult<Vec<PreparedTableMutation>> {
     let column_schemas: Vec<ColumnSchema> =
         replicated_table_schema.column_schemas().cloned().collect();
+    let identity_columns: Vec<String> = replicated_table_schema
+        .identity_column_schemas()
+        .map(|col| quote_identifier(&col.name).into_owned())
+        .collect();
+    let all_columns: Vec<String> = replicated_table_schema
+        .column_schemas()
+        .map(|col| quote_identifier(&col.name).into_owned())
+        .collect();
     let mut prepared_mutations = Vec::new();
     let mut upsert_rows = Vec::new();
     let mut delete_predicates = Vec::new();
+    let mut merge_rows: Vec<TableRow> = Vec::new();
 
     for mutation in mutations {
         match mutation {
@@ -1161,15 +1171,17 @@ fn prepare_table_mutations(
                         origin: "delete",
                     });
                 }
-
-                prepared_mutations.push(PreparedTableMutation::Delete {
-                    predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
-                    origin: "replace",
-                });
-                prepared_mutations
-                    .push(PreparedTableMutation::Upsert(prepare_rows(vec![row], &column_schemas)));
+                merge_rows.push(row);
             }
         }
+    }
+
+    if !merge_rows.is_empty() {
+        prepared_mutations.push(PreparedTableMutation::Merge {
+            rows: prepare_rows(merge_rows, &column_schemas),
+            identity_columns,
+            all_columns,
+        });
     }
 
     if !upsert_rows.is_empty() {
@@ -1941,6 +1953,9 @@ fn apply_table_mutation(
             assignments.as_slice(),
             predicate,
         ),
+        PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
+            apply_merge_mutation(conn, rows, reusable_staging_table, identity_columns, all_columns)
+        }
     }
 }
 
@@ -2017,6 +2032,61 @@ fn apply_update_mutation(
     Ok(())
 }
 
+/// Applies a MERGE INTO statement: loads rows into staging, then merges them
+/// into the target table in a single scan using identity columns for matching.
+fn apply_merge_mutation(
+    conn: &duckdb::Connection,
+    prepared_rows: &PreparedRows,
+    reusable_staging_table: &mut ReusableStagingTable,
+    identity_columns: &[String],
+    all_columns: &[String],
+) -> EtlResult<()> {
+    let row_count = prepared_rows_count(prepared_rows);
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    // Load rows into the staging table.
+    reusable_staging_table.prepare(conn)?;
+    reusable_staging_table.load_rows(conn, prepared_rows)?;
+
+    // Build ON clause from identity columns.
+    let on_clause = identity_columns
+        .iter()
+        .map(|col| format!("target.{col} = source.{col}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    // Build UPDATE SET clause (all columns).
+    let set_clause = all_columns
+        .iter()
+        .map(|col| format!("{col} = source.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let values = all_columns
+        .iter()
+        .map(|col| format!("source.{col}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"MERGE INTO {LAKE_CATALOG}."{table}" AS target USING {staging:?} AS source ON ({on_clause}) WHEN MATCHED THEN UPDATE SET {set_clause} WHEN NOT MATCHED THEN INSERT VALUES ({values});"#,
+        table = reusable_staging_table.table_name,
+        staging = &reusable_staging_table.staging_name,
+    );
+
+    conn.execute_batch(&sql).map_err(|error| {
+        tracing::error!(?error, row_count, "error MERGE INTO");
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake MERGE INTO failed",
+            source: error
+        )
+    })?;
+
+    Ok(())
+}
+
 /// Returns the number of values carried by a prepared row payload.
 fn prepared_rows_count(prepared_rows: &PreparedRows) -> usize {
     match prepared_rows {
@@ -2056,7 +2126,9 @@ fn apply_sub_batch_rows(batch: &PreparedDuckLakeTableBatch) -> Option<usize> {
             PreparedRows::Appender(values) => values.len(),
             PreparedRows::SqlLiterals(values) => values.len(),
         }),
-        PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => None,
+        PreparedTableMutation::Delete { .. }
+        | PreparedTableMutation::Update { .. }
+        | PreparedTableMutation::Merge { .. } => None,
     }
 }
 
@@ -2073,6 +2145,7 @@ fn batch_log_kind(batch: &PreparedDuckLakeTableBatch) -> &'static str {
                     PreparedTableMutation::Upsert(_),
                 ] => origin,
                 [PreparedTableMutation::Update { .. }] => "update",
+                [PreparedTableMutation::Merge { .. }] => "merge",
                 _ => "mutation",
             }
         }
