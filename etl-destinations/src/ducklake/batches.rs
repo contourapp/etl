@@ -65,7 +65,7 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 ///
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
-const SQL_DELETE_BATCH_SIZE: usize = 16;
+const SQL_DELETE_BATCH_SIZE: usize = 128;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
@@ -645,10 +645,7 @@ pub(super) fn prepare_copy_table_batch(
         action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
             prepare_rows(
                 table_rows,
-                &replicated_table_schema
-                    .column_schemas()
-                    .cloned()
-                    .collect::<Vec<_>>(),
+                &replicated_table_schema.column_schemas().cloned().collect::<Vec<_>>(),
             ),
         )]),
     })
@@ -1132,11 +1129,10 @@ fn prepare_table_mutations(
                             )?],
                             origin: "update",
                         });
-                        prepared_mutations
-                            .push(PreparedTableMutation::Upsert(prepare_rows(
-                                vec![upsert_row],
-                                &column_schemas,
-                            )));
+                        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
+                            vec![upsert_row],
+                            &column_schemas,
+                        )));
                     }
                     UpdatedTableRow::Partial(partial_row) => {
                         prepared_mutations.push(PreparedTableMutation::Update {
@@ -1170,19 +1166,15 @@ fn prepare_table_mutations(
                     predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
                     origin: "replace",
                 });
-                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                    vec![row],
-                    &column_schemas,
-                )));
+                prepared_mutations
+                    .push(PreparedTableMutation::Upsert(prepare_rows(vec![row], &column_schemas)));
             }
         }
     }
 
     if !upsert_rows.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-            upsert_rows,
-            &column_schemas,
-        )));
+        prepared_mutations
+            .push(PreparedTableMutation::Upsert(prepare_rows(upsert_rows, &column_schemas)));
     }
     if !delete_predicates.is_empty() {
         prepared_mutations.push(PreparedTableMutation::Delete {
