@@ -1492,6 +1492,8 @@ where
             "flushing batch to destination",
         );
 
+        dbg!(&events_batch);
+
         // Capture dispatch-time metrics; they are carried through the result channel
         // and recorded once the destination acknowledges the batch.
         let metadata = ApplyLoopAsyncResultMetadata {

@@ -65,14 +65,14 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 ///
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
-const SQL_DELETE_BATCH_SIZE: usize = 128;
+const SQL_DELETE_BATCH_SIZE: usize = 64;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
 /// Keeping mixed insert/delete/update streams in the same batch improves
 /// insert throughput on interleaved workloads while still capping transaction
 /// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 1024;
+const CDC_MUTATION_BATCH_SIZE: usize = 128;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Inline small marker-table writes in the DuckLake metadata catalog instead of
