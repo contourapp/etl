@@ -16,14 +16,11 @@ pub(super) fn prepare_rows(
     table_rows: Vec<TableRow>,
     column_schemas: &[ColumnSchema],
 ) -> PreparedRows {
-    let has_range_columns = column_schemas
-        .iter()
-        .any(|cs| is_range_type(&cs.typ) || is_range_array_type(&cs.typ));
+    let has_range_columns =
+        column_schemas.iter().any(|cs| is_range_type(&cs.typ) || is_range_array_type(&cs.typ));
 
     if has_range_columns
-        || table_rows
-            .iter()
-            .any(|row| row.values().iter().any(cell_requires_sql_literals))
+        || table_rows.iter().any(|row| row.values().iter().any(cell_requires_sql_literals))
     {
         return PreparedRows::SqlLiterals(
             table_rows
@@ -137,16 +134,10 @@ fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
     let lower = lower.trim_matches('"');
     let upper = upper.trim_matches('"');
 
-    let lower_lit = if lower.is_empty() {
-        "NULL".to_string()
-    } else {
-        format_typed_literal(lower, bound_type)
-    };
-    let upper_lit = if upper.is_empty() {
-        "NULL".to_string()
-    } else {
-        format_typed_literal(upper, bound_type)
-    };
+    let lower_lit =
+        if lower.is_empty() { "NULL".to_string() } else { format_typed_literal(lower, bound_type) };
+    let upper_lit =
+        if upper.is_empty() { "NULL".to_string() } else { format_typed_literal(upper, bound_type) };
 
     format!("{{'lower': {lower_lit}, 'upper': {upper_lit}}}")
 }
@@ -174,10 +165,8 @@ fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
                 "NULL".to_string()
             } else {
                 // Unescape: remove surrounding quotes and unescape \"
-                let unquoted = elem
-                    .trim_start_matches('"')
-                    .trim_end_matches('"')
-                    .replace("\\\"", "\"");
+                let unquoted =
+                    elem.trim_start_matches('"').trim_end_matches('"').replace("\\\"", "\"");
                 range_text_to_struct_literal(&unquoted, bound_type)
             }
         })
@@ -599,36 +588,25 @@ mod tests {
     #[test]
     fn test_numeric_cell_emits_decimal_cast_literal() {
         let n: PgNumeric = "123.45".parse().unwrap();
-        assert_eq!(
-            cell_to_sql_literal(Cell::Numeric(n)),
-            "CAST('123.45' AS DECIMAL(38, 10))"
-        );
+        assert_eq!(cell_to_sql_literal(Cell::Numeric(n)), "CAST('123.45' AS DECIMAL(38, 10))");
     }
 
     #[test]
     fn test_numeric_cell_coerces_nan_and_infinity_to_null() {
         assert_eq!(cell_to_sql_literal(Cell::Numeric(PgNumeric::NaN)), "NULL");
-        assert_eq!(
-            cell_to_sql_literal(Cell::Numeric(PgNumeric::PositiveInfinity)),
-            "NULL"
-        );
-        assert_eq!(
-            cell_to_sql_literal(Cell::Numeric(PgNumeric::NegativeInfinity)),
-            "NULL"
-        );
+        assert_eq!(cell_to_sql_literal(Cell::Numeric(PgNumeric::PositiveInfinity)), "NULL");
+        assert_eq!(cell_to_sql_literal(Cell::Numeric(PgNumeric::NegativeInfinity)), "NULL");
     }
 
     #[test]
     fn test_prepare_rows_routes_numeric_through_sql_literals() {
         let schemas = vec![
-            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
-            ColumnSchema::new("amount".into(), Type::NUMERIC, -1, true, false),
+            ColumnSchema::new("id".into(), Type::INT4, -1, 0, Some(0), false),
+            ColumnSchema::new("amount".into(), Type::NUMERIC, -1, 1, None, true),
         ];
         let n: PgNumeric = "-9.87".parse().unwrap();
-        let prepared = prepare_rows(
-            vec![TableRow::new(vec![Cell::I32(1), Cell::Numeric(n)])],
-            &schemas,
-        );
+        let prepared =
+            prepare_rows(vec![TableRow::new(vec![Cell::I32(1), Cell::Numeric(n)])], &schemas);
 
         match prepared {
             PreparedRows::SqlLiterals(rows) => {
@@ -658,8 +636,8 @@ mod tests {
     #[test]
     fn test_prepare_rows_uses_sql_literals_for_arrays() {
         let schemas = vec![
-            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
-            ColumnSchema::new("tags".into(), Type::INT4_ARRAY, -1, true, false),
+            ColumnSchema::new("id".into(), Type::INT4, -1, 0, Some(0), false),
+            ColumnSchema::new("tags".into(), Type::INT4_ARRAY, -1, 1, None, true),
         ];
         let prepared = prepare_rows(
             vec![TableRow::new(vec![
@@ -680,7 +658,10 @@ mod tests {
     #[test]
     fn test_range_text_to_struct_literal_standard() {
         assert_eq!(
-            range_text_to_struct_literal("[2026-03-24 15:32:00+00,2026-03-24 20:20:00+00)", "TIMESTAMPTZ"),
+            range_text_to_struct_literal(
+                "[2026-03-24 15:32:00+00,2026-03-24 20:20:00+00)",
+                "TIMESTAMPTZ"
+            ),
             "{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}"
         );
     }
@@ -733,10 +714,7 @@ mod tests {
     #[test]
     fn test_range_array_text_to_list_literal_with_null() {
         assert_eq!(
-            range_array_text_to_list_literal(
-                r#"{NULL,"[\"1\",\"10\")"}"#,
-                "INTEGER"
-            ),
+            range_array_text_to_list_literal(r#"{NULL,"[\"1\",\"10\")"}"#, "INTEGER"),
             "[NULL, {'lower': INTEGER '1', 'upper': INTEGER '10'}]"
         );
     }
@@ -755,13 +733,15 @@ mod tests {
     #[test]
     fn test_prepare_rows_uses_sql_literals_for_range_columns() {
         let schemas = vec![
-            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
-            ColumnSchema::new("effective_range".into(), Type::TSTZ_RANGE_ARRAY, -1, true, false),
+            ColumnSchema::new("id".into(), Type::INT4, -1, 0, Some(0), false),
+            ColumnSchema::new("effective_range".into(), Type::TSTZ_RANGE_ARRAY, -1, 1, None, true),
         ];
         let prepared = prepare_rows(
             vec![TableRow::new(vec![
                 Cell::I32(1),
-                Cell::String(r#"{"[\"2026-03-24 15:32:00+00\",\"2026-03-24 20:20:00+00\")"}"#.to_string()),
+                Cell::String(
+                    r#"{"[\"2026-03-24 15:32:00+00\",\"2026-03-24 20:20:00+00\")"}"#.to_string(),
+                ),
             ])],
             &schemas,
         );
@@ -770,7 +750,9 @@ mod tests {
             PreparedRows::SqlLiterals(rows) => {
                 assert_eq!(
                     rows,
-                    vec!["(1, [{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}])"]
+                    vec![
+                        "(1, [{'lower': TIMESTAMPTZ '2026-03-24 15:32:00+00', 'upper': TIMESTAMPTZ '2026-03-24 20:20:00+00'}])"
+                    ]
                 );
             }
             PreparedRows::Appender(_) => panic!("expected sql literal fallback for range columns"),
@@ -780,13 +762,10 @@ mod tests {
     #[test]
     fn test_prepare_rows_null_range_column() {
         let schemas = vec![
-            ColumnSchema::new("id".into(), Type::INT4, -1, false, true),
-            ColumnSchema::new("r".into(), Type::TSTZ_RANGE, -1, true, false),
+            ColumnSchema::new("id".into(), Type::INT4, -1, 0, Some(0), false),
+            ColumnSchema::new("r".into(), Type::TSTZ_RANGE, -1, 1, None, true),
         ];
-        let prepared = prepare_rows(
-            vec![TableRow::new(vec![Cell::I32(1), Cell::Null])],
-            &schemas,
-        );
+        let prepared = prepare_rows(vec![TableRow::new(vec![Cell::I32(1), Cell::Null])], &schemas);
 
         match prepared {
             PreparedRows::SqlLiterals(rows) => {

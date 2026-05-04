@@ -70,7 +70,7 @@ use crate::{
             DuckLakeMetricsSampler, ETL_DUCKLAKE_POOL_SIZE, register_metrics,
             resolve_ducklake_metadata_schema_blocking, spawn_ducklake_metrics_sampler,
         },
-        schema::build_create_table_sql_ducklake,
+        schema::{build_alter_table_storage_sql, build_create_table_sql_ducklake, TableStorageConfig},
     },
     table_name::try_stringify_table_name,
 };
@@ -135,6 +135,8 @@ pub struct DuckLakeDestination<S> {
     table_creation_slots: Arc<Semaphore>,
     table_write_slots: Arc<Mutex<HashMap<DuckLakeTableName, Arc<Semaphore>>>>,
     store: S,
+    /// Per-table physical storage configuration keyed by DuckLake table name.
+    table_storage_config: Arc<HashMap<String, TableStorageConfig>>,
     /// Cache of table names whose DDL has already been executed.
     created_tables: Arc<Mutex<HashSet<DuckLakeTableName>>>,
     /// Cache tracking whether the ETL batch marker table already exists. If
@@ -435,6 +437,7 @@ where
         maintenance_pending_bytes_threshold: Option<u64>,
         maintenance_flush_poll_interval: Option<Duration>,
         store: S,
+        table_storage_config: HashMap<String, TableStorageConfig>,
     ) -> EtlResult<Self> {
         register_metrics();
 
@@ -576,6 +579,7 @@ where
             table_creation_slots: Arc::new(Semaphore::new(1)),
             table_write_slots: Arc::default(),
             store,
+            table_storage_config: Arc::new(table_storage_config),
             created_tables: Arc::clone(&created_tables),
             applied_batches_table_created: Arc::default(),
             streaming_progress_table_created: Arc::default(),
@@ -1098,6 +1102,33 @@ where
             },
         )
         .await?;
+
+        // Apply storage config (sort/partition) if configured for this table.
+        if let Some(storage_config) = self.table_storage_config.get(table_name.as_str()) {
+            let qualified_name = format!("{LAKE_CATALOG}.{}", quote_identifier(&table_name));
+            let alter_stmts = build_alter_table_storage_sql(&qualified_name, storage_config);
+            if !alter_stmts.is_empty() {
+                let alter_sql = alter_stmts.join(";\n");
+                run_duckdb_blocking(
+                    Arc::clone(&self.pool),
+                    Arc::clone(&self.blocking_slots),
+                    DuckDbBlockingOperationKind::Foreground,
+                    move |conn| -> EtlResult<()> {
+                        conn.execute_batch(&alter_sql).map_err(|e| {
+                            etl_error!(
+                                ErrorKind::DestinationQueryFailed,
+                                "DuckLake ALTER TABLE storage config failed",
+                                format_query_error_detail(&alter_sql, &e),
+                                source: e
+                            )
+                        })?;
+                        Ok(())
+                    },
+                )
+                .await?;
+            }
+        }
+
         self.store.store_destination_table_metadata(table_id, metadata.to_applied()).await?;
 
         Ok(table_name)
@@ -1711,7 +1742,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             store,
+            HashMap::new(),
         )
         .await
         .expect("failed to create destination");
@@ -1777,7 +1812,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             store,
+            HashMap::new(),
         )
         .await
         .expect("failed to create destination");
@@ -1839,7 +1878,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             store,
+            HashMap::new(),
         )
         .await
         .expect("failed to create destination");

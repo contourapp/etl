@@ -195,6 +195,7 @@ pub(crate) async fn start_replicator_with_config(
                 None,
                 None,
                 state_store.clone(),
+                HashMap::new(),
             )
             .await?;
 

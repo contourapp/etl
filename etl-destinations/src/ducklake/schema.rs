@@ -281,14 +281,8 @@ mod tests {
             "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]"
         );
         // Non-range types still work
-        assert_eq!(
-            postgres_column_type_to_ducklake_sql(&Type::INT4),
-            "INTEGER"
-        );
-        assert_eq!(
-            postgres_column_type_to_ducklake_sql(&Type::INT4_ARRAY),
-            "INTEGER[]"
-        );
+        assert_eq!(postgres_column_type_to_ducklake_sql(&Type::INT4), "INTEGER");
+        assert_eq!(postgres_column_type_to_ducklake_sql(&Type::INT4_ARRAY), "INTEGER[]");
     }
 
     #[test]
@@ -315,7 +309,7 @@ mod tests {
         assert_eq!(stmts.len(), 1);
         assert_eq!(
             stmts[0],
-            "ALTER TABLE lake.\"my_table\" SET SORTED BY (\"created_at\" DESC, \"id\" ASC)"
+            "ALTER TABLE lake.\"my_table\" SET SORTED BY (created_at DESC, id ASC)"
         );
     }
 
@@ -336,15 +330,12 @@ mod tests {
     #[test]
     fn alter_table_storage_sql_both() {
         let config = TableStorageConfig {
-            sort_keys: vec![SortKey {
-                column: "ts".to_string(),
-                direction: SortDirection::Asc,
-            }],
+            sort_keys: vec![SortKey { column: "ts".to_string(), direction: SortDirection::Asc }],
             partition_by: vec!["month(ts)".to_string()],
         };
         let stmts = build_alter_table_storage_sql("lake.\"data\"", &config);
         assert_eq!(stmts.len(), 2);
-        assert_eq!(stmts[0], "ALTER TABLE lake.\"data\" SET SORTED BY (\"ts\" ASC)");
+        assert_eq!(stmts[0], "ALTER TABLE lake.\"data\" SET SORTED BY (ts ASC)");
         assert_eq!(stmts[1], "ALTER TABLE lake.\"data\" SET PARTITIONED BY (month(ts))");
     }
 

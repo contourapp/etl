@@ -751,6 +751,7 @@ impl Validator for DucklakeValidator {
             None,
             None,
             MemoryStore::new(),
+            HashMap::new(),
         )
         .await
         {

@@ -2376,7 +2376,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_table_mutations_replace_emits_delete_then_upsert() {
+    fn prepare_table_mutations_replace_emits_merge() {
         let replicated_table_schema = make_replicated_schema();
         let row = TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_string())]);
 
@@ -2384,26 +2384,17 @@ mod tests {
             prepare_table_mutations(&replicated_table_schema, vec![TableMutation::Replace(row)])
                 .unwrap();
 
-        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.len(), 1);
         match &prepared[0] {
-            PreparedTableMutation::Delete { predicates, origin } => {
-                assert_eq!(predicates, &vec!["id = 1".to_string()]);
-                assert_eq!(origin, &"replace");
+            PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
+                match rows {
+                    PreparedRows::Appender(values) => assert_eq!(values.len(), 1),
+                    PreparedRows::SqlLiterals(values) => assert_eq!(values.len(), 1),
+                }
+                assert!(!identity_columns.is_empty());
+                assert!(!all_columns.is_empty());
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                panic!("expected delete first")
-            }
-        }
-        match &prepared[1] {
-            PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
-                assert_eq!(rows.len(), 1);
-            }
-            PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) => {
-                panic!("expected appender payload")
-            }
-            PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
-                panic!("expected upsert second")
-            }
+            _ => panic!("expected Merge mutation for Replace"),
         }
     }
 
@@ -2429,7 +2420,7 @@ mod tests {
                 assert_eq!(assignments, &vec!["id = 1".to_string(), "name = 'after'".to_string()]);
                 assert_eq!(predicate, "id = 1");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2485,7 +2476,7 @@ mod tests {
                 );
                 assert_eq!(predicate, "email = 'alice@example.com'");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2548,7 +2539,7 @@ mod tests {
                      'toast'"
                 );
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
+            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2592,10 +2583,10 @@ mod tests {
                     PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
                         assert_eq!(rows.len(), 2);
                     }
-                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) => {
+                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) | PreparedTableMutation::Merge { .. } => {
                         panic!("expected appender payload")
                     }
-                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
+                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
                         panic!("expected upsert")
                     }
                 }
@@ -2699,7 +2690,7 @@ mod tests {
                         assert_eq!(origin, &"delete");
                         assert_eq!(predicates, &vec!["id = 1".to_string(), "id = 2".to_string()]);
                     }
-                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
                         panic!("expected delete batch")
                     }
                 }
@@ -2798,7 +2789,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
                     panic!("expected delete batch")
                 }
             },
@@ -2810,7 +2801,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), 1);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
+                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
                     panic!("expected delete batch")
                 }
             },

@@ -22,7 +22,7 @@
 
 #[cfg(feature = "test-utils")]
 use std::sync::LazyLock;
-use std::{f64::consts::PI, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, f64::consts::PI, path::Path, sync::Arc, time::Duration};
 
 use chrono::NaiveDate;
 use duckdb::Connection;
@@ -292,7 +292,11 @@ async fn write_table_rows_basic() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -351,7 +355,11 @@ async fn write_table_rows_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -395,7 +403,11 @@ async fn ducklake_rejects_zero_pool_size() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         MemoryStore::new(),
+        HashMap::new(),
     )
     .await
     .err()
@@ -430,7 +442,11 @@ async fn ducklake_rejects_non_postgres_catalog_url() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         MemoryStore::new(),
+        HashMap::new(),
     )
     .await
     .err()
@@ -454,7 +470,11 @@ async fn ducklake_rejects_invalid_expire_snapshots_retention() {
         None,
         None,
         Some("definitely not an interval".to_string()),
+        None,
+        None,
+        None,
         MemoryStore::new(),
+        HashMap::new(),
     )
     .await
     .err()
@@ -494,7 +514,11 @@ async fn write_table_rows_reuses_warm_pooled_connection() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -552,7 +576,11 @@ async fn write_table_rows_replaces_broken_pooled_connection_after_retry() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -612,7 +640,11 @@ async fn write_table_rows_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -663,7 +695,11 @@ async fn concurrent_same_table_copy_batches_complete() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             store,
+            HashMap::new(),
         )
         .await
         .unwrap(),
@@ -789,7 +825,11 @@ async fn write_table_rows_empty_creates_table() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -826,7 +866,11 @@ async fn truncate_clears_rows() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -887,7 +931,11 @@ async fn truncate_clears_copy_markers_for_recopy() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -932,7 +980,11 @@ async fn write_events() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1023,7 +1075,11 @@ async fn write_events_small_batch_stays_inlined_after_return() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1076,7 +1132,11 @@ async fn write_events_with_old_row_update() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1153,7 +1213,11 @@ async fn write_events_with_partial_updates() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1246,7 +1310,11 @@ async fn write_events_without_replica_identity_rejects_mutations() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1334,7 +1402,11 @@ async fn write_events_replay_is_idempotent() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1430,7 +1502,11 @@ async fn write_events_same_commit_lsn_higher_tx_ordinal_still_applies() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1508,7 +1584,11 @@ async fn write_events_restart_overlap_rebatches_only_pending_suffix() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store.clone(),
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1550,7 +1630,11 @@ async fn write_events_restart_overlap_rebatches_only_pending_suffix() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1627,7 +1711,11 @@ async fn write_events_reuses_one_staging_table_per_atomic_batch() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1714,7 +1802,11 @@ async fn applied_batches_table_uses_data_inlining() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1764,7 +1856,11 @@ async fn write_events_mixed_multi_table_batches() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1897,7 +1993,11 @@ async fn write_events_truncate_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -1992,7 +2092,11 @@ async fn write_events_retry_after_post_commit_failure_is_idempotent() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
@@ -2096,7 +2200,11 @@ async fn concurrent_writes_with_single_slot_complete() {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             store,
+            HashMap::new(),
         )
         .await
         .unwrap(),
@@ -2161,7 +2269,11 @@ async fn type_mapping_round_trip() {
         None,
         None,
         None,
+        None,
+        None,
+        None,
         store,
+        HashMap::new(),
     )
     .await
     .unwrap();
