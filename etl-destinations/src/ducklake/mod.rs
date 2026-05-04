@@ -35,3 +35,4 @@ pub use batches::{
     reset_ducklake_test_hooks,
 };
 pub use config::S3Config;
+pub use schema::{SortDirection, SortKey, TableStorageConfig};

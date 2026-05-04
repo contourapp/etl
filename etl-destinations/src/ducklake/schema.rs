@@ -93,6 +93,81 @@ pub fn postgres_column_type_to_ducklake_sql(typ: &Type) -> &'static str {
     }
 }
 
+/// Sort direction for a DuckLake sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SortDirection {
+    /// Ascending sort order.
+    Asc,
+    /// Descending sort order.
+    Desc,
+}
+
+/// A single column sort key for DuckLake's `SET SORTED BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortKey {
+    /// Column name to sort by.
+    pub column: String,
+    /// Sort direction.
+    pub direction: SortDirection,
+}
+
+/// Per-table physical storage configuration for DuckLake.
+///
+/// Controls the sort order and partitioning scheme applied to a DuckLake table
+/// via `ALTER TABLE ... SET SORTED BY` and `ALTER TABLE ... SET PARTITIONED BY`
+/// after table creation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableStorageConfig {
+    /// Sort keys applied via `ALTER TABLE ... SET SORTED BY (col DIR, ...)`.
+    pub sort_keys: Vec<SortKey>,
+    /// Partition expressions applied via `ALTER TABLE ... SET PARTITIONED BY (expr, ...)`.
+    ///
+    /// Examples: `"year(created_at)"`, `"bucket(8, org_id)"`.
+    pub partition_by: Vec<String>,
+}
+
+/// Builds `ALTER TABLE` DDL statements for the given DuckLake table storage
+/// configuration.
+///
+/// Returns up to two statements: one for `SET SORTED BY` and one for
+/// `SET PARTITIONED BY`. Returns an empty vec if both fields are empty.
+///
+/// `qualified_table_name` must already be fully qualified and quoted
+/// (e.g. `lake."my_table"`).
+pub(super) fn build_alter_table_storage_sql(
+    qualified_table_name: &str,
+    config: &TableStorageConfig,
+) -> Vec<String> {
+    let mut stmts = Vec::new();
+
+    if !config.sort_keys.is_empty() {
+        let keys: Vec<String> = config
+            .sort_keys
+            .iter()
+            .map(|k| {
+                let dir = match k.direction {
+                    SortDirection::Asc => "ASC",
+                    SortDirection::Desc => "DESC",
+                };
+                format!("{} {dir}", quote_identifier(&k.column))
+            })
+            .collect();
+        stmts.push(format!(
+            "ALTER TABLE {qualified_table_name} SET SORTED BY ({})",
+            keys.join(", ")
+        ));
+    }
+
+    if !config.partition_by.is_empty() {
+        stmts.push(format!(
+            "ALTER TABLE {qualified_table_name} SET PARTITIONED BY ({})",
+            config.partition_by.join(", ")
+        ));
+    }
+
+    stmts
+}
+
 /// Builds a `CREATE TABLE IF NOT EXISTS` DDL statement for the given table name
 /// and schema.
 ///
@@ -225,5 +300,71 @@ mod tests {
 
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS \"odd\"\"table\""));
         assert!(sql.contains("  \"select\" INTEGER NOT NULL"));
+    }
+
+    #[test]
+    fn alter_table_storage_sql_sort_only() {
+        let config = TableStorageConfig {
+            sort_keys: vec![
+                SortKey { column: "created_at".to_string(), direction: SortDirection::Desc },
+                SortKey { column: "id".to_string(), direction: SortDirection::Asc },
+            ],
+            partition_by: vec![],
+        };
+        let stmts = build_alter_table_storage_sql("lake.\"my_table\"", &config);
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "ALTER TABLE lake.\"my_table\" SET SORTED BY (\"created_at\" DESC, \"id\" ASC)"
+        );
+    }
+
+    #[test]
+    fn alter_table_storage_sql_partition_only() {
+        let config = TableStorageConfig {
+            sort_keys: vec![],
+            partition_by: vec!["year(created_at)".to_string(), "bucket(8, org_id)".to_string()],
+        };
+        let stmts = build_alter_table_storage_sql("lake.\"events\"", &config);
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0],
+            "ALTER TABLE lake.\"events\" SET PARTITIONED BY (year(created_at), bucket(8, org_id))"
+        );
+    }
+
+    #[test]
+    fn alter_table_storage_sql_both() {
+        let config = TableStorageConfig {
+            sort_keys: vec![SortKey {
+                column: "ts".to_string(),
+                direction: SortDirection::Asc,
+            }],
+            partition_by: vec!["month(ts)".to_string()],
+        };
+        let stmts = build_alter_table_storage_sql("lake.\"data\"", &config);
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "ALTER TABLE lake.\"data\" SET SORTED BY (\"ts\" ASC)");
+        assert_eq!(stmts[1], "ALTER TABLE lake.\"data\" SET PARTITIONED BY (month(ts))");
+    }
+
+    #[test]
+    fn alter_table_storage_sql_empty_config() {
+        let config = TableStorageConfig::default();
+        let stmts = build_alter_table_storage_sql("lake.\"empty\"", &config);
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn alter_table_storage_sql_quotes_column_names() {
+        let config = TableStorageConfig {
+            sort_keys: vec![SortKey {
+                column: "select".to_string(),
+                direction: SortDirection::Asc,
+            }],
+            partition_by: vec![],
+        };
+        let stmts = build_alter_table_storage_sql("lake.\"t\"", &config);
+        assert_eq!(stmts[0], "ALTER TABLE lake.\"t\" SET SORTED BY (\"select\" ASC)");
     }
 }
