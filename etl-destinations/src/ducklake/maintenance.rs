@@ -787,7 +787,6 @@ fn try_send_maintenance_notification(
 
 /// Starts warming the maintenance pool and spawns the periodic DuckLake worker.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_ducklake_maintenance_worker(
     manager: DuckLakeConnectionManager,
     checkpoint_gate: Arc<RwLock<()>>,
@@ -993,7 +992,7 @@ async fn run_ducklake_maintenance_worker(
                 // on the checkpoint gate excludes apply for the duration of the
                 // compaction commit. If apply is busy we skip this cycle and retry on
                 // the next flush_interval tick.
-                if let Ok(checkpoint_guard) = checkpoint_gate.clone().try_write_owned() {
+                if let Ok(checkpoint_guard) = Arc::clone(&checkpoint_gate).try_write_owned() {
                     match pool.get_or_init_pool().await {
                         Ok(maintenance_pool) => {
                             let outcome = run_duckdb_blocking(

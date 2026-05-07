@@ -72,7 +72,7 @@ const SQL_DELETE_BATCH_SIZE: usize = 64;
 /// Keeping mixed insert/delete/update streams in the same batch improves
 /// insert throughput on interleaved workloads while still capping transaction
 /// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 128;
+const CDC_MUTATION_BATCH_SIZE: usize = 1024;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Inline small marker-table writes in the DuckLake metadata catalog instead of
@@ -2064,11 +2064,8 @@ fn apply_merge_mutation(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let values = all_columns
-        .iter()
-        .map(|col| format!("source.{col}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let values =
+        all_columns.iter().map(|col| format!("source.{col}")).collect::<Vec<_>>().join(", ");
     let sql = format!(
         r#"MERGE INTO {LAKE_CATALOG}."{table}" AS target USING {staging:?} AS source ON ({on_clause}) WHEN MATCHED THEN UPDATE SET {set_clause} WHEN NOT MATCHED THEN INSERT VALUES ({values});"#,
         table = reusable_staging_table.table_name,
@@ -2420,7 +2417,9 @@ mod tests {
                 assert_eq!(assignments, &vec!["id = 1".to_string(), "name = 'after'".to_string()]);
                 assert_eq!(predicate, "id = 1");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
+            PreparedTableMutation::Upsert(_)
+            | PreparedTableMutation::Delete { .. }
+            | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2476,7 +2475,9 @@ mod tests {
                 );
                 assert_eq!(predicate, "email = 'alice@example.com'");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
+            PreparedTableMutation::Upsert(_)
+            | PreparedTableMutation::Delete { .. }
+            | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2539,7 +2540,9 @@ mod tests {
                      'toast'"
                 );
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } | PreparedTableMutation::Merge { .. } => {
+            PreparedTableMutation::Upsert(_)
+            | PreparedTableMutation::Delete { .. }
+            | PreparedTableMutation::Merge { .. } => {
                 panic!("expected update")
             }
         }
@@ -2583,10 +2586,11 @@ mod tests {
                     PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
                         assert_eq!(rows.len(), 2);
                     }
-                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) | PreparedTableMutation::Merge { .. } => {
+                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_))
+                    | PreparedTableMutation::Merge { .. } => {
                         panic!("expected appender payload")
                     }
-                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
+                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
                         panic!("expected upsert")
                     }
                 }
@@ -2690,7 +2694,9 @@ mod tests {
                         assert_eq!(origin, &"delete");
                         assert_eq!(predicates, &vec!["id = 1".to_string(), "id = 2".to_string()]);
                     }
-                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
+                    PreparedTableMutation::Upsert(_)
+                    | PreparedTableMutation::Update { .. }
+                    | PreparedTableMutation::Merge { .. } => {
                         panic!("expected delete batch")
                     }
                 }
@@ -2789,7 +2795,9 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
+                PreparedTableMutation::Upsert(_)
+                | PreparedTableMutation::Update { .. }
+                | PreparedTableMutation::Merge { .. } => {
                     panic!("expected delete batch")
                 }
             },
@@ -2801,7 +2809,9 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), 1);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } | PreparedTableMutation::Merge { .. } => {
+                PreparedTableMutation::Upsert(_)
+                | PreparedTableMutation::Update { .. }
+                | PreparedTableMutation::Merge { .. } => {
                     panic!("expected delete batch")
                 }
             },

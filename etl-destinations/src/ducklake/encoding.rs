@@ -359,8 +359,7 @@ fn array_cell_to_sql_literal(arr: ArrayCell) -> String {
         ArrayCell::Numeric(v) => v
             .into_iter()
             .map(|o| {
-                o.map(|value| numeric_to_decimal_literal(&value))
-                    .unwrap_or_else(|| "NULL".to_string())
+                o.map_or_else(|| "NULL".to_string(), |value| numeric_to_decimal_literal(&value))
             })
             .collect(),
         ArrayCell::Date(v) => v

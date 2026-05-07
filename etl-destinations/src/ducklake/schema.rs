@@ -56,26 +56,26 @@ fn postgres_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
 
 /// Returns the DuckDB SQL type string for a Postgres scalar range type.
 fn postgres_range_type_to_ducklake_sql(typ: &Type) -> &'static str {
-    match typ {
-        &Type::TSTZ_RANGE => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)",
-        &Type::TS_RANGE => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)",
-        &Type::DATE_RANGE => "STRUCT(\"lower\" DATE, \"upper\" DATE)",
-        &Type::INT4_RANGE => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)",
-        &Type::INT8_RANGE => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)",
-        &Type::NUM_RANGE => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))",
+    match *typ {
+        Type::TSTZ_RANGE => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)",
+        Type::TS_RANGE => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)",
+        Type::DATE_RANGE => "STRUCT(\"lower\" DATE, \"upper\" DATE)",
+        Type::INT4_RANGE => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)",
+        Type::INT8_RANGE => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)",
+        Type::NUM_RANGE => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))",
         _ => "VARCHAR",
     }
 }
 
 /// Returns the DuckDB SQL type string for a Postgres range array type.
 fn postgres_range_array_type_to_ducklake_sql(typ: &Type) -> &'static str {
-    match typ {
-        &Type::TSTZ_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]",
-        &Type::TS_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)[]",
-        &Type::DATE_RANGE_ARRAY => "STRUCT(\"lower\" DATE, \"upper\" DATE)[]",
-        &Type::INT4_RANGE_ARRAY => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)[]",
-        &Type::INT8_RANGE_ARRAY => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)[]",
-        &Type::NUM_RANGE_ARRAY => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))[]",
+    match *typ {
+        Type::TSTZ_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMPTZ, \"upper\" TIMESTAMPTZ)[]",
+        Type::TS_RANGE_ARRAY => "STRUCT(\"lower\" TIMESTAMP, \"upper\" TIMESTAMP)[]",
+        Type::DATE_RANGE_ARRAY => "STRUCT(\"lower\" DATE, \"upper\" DATE)[]",
+        Type::INT4_RANGE_ARRAY => "STRUCT(\"lower\" INTEGER, \"upper\" INTEGER)[]",
+        Type::INT8_RANGE_ARRAY => "STRUCT(\"lower\" BIGINT, \"upper\" BIGINT)[]",
+        Type::NUM_RANGE_ARRAY => "STRUCT(\"lower\" DECIMAL(38, 10), \"upper\" DECIMAL(38, 10))[]",
         _ => "VARCHAR[]",
     }
 }
