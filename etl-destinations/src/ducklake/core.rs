@@ -1043,6 +1043,19 @@ where
             }
         }
 
+        // Persistent fast path: a previous process already finished CREATE +
+        // storage-config ALTER for this table (metadata is in the Applied
+        // state). Skip both DDL paths so we don't churn DuckLake's
+        // schema_version on every restart — each ALTER bumps schema_version
+        // and registers a fresh `ducklake_inlined_data_<tid>_<sv>` table that
+        // DuckLake never reaps (see duckdb/ducklake#1065).
+        if let Some(existing) = self.store.get_destination_table_metadata(table_id).await?
+            && existing.is_applied()
+        {
+            self.created_tables.lock().insert(table_name.clone());
+            return Ok(table_name);
+        }
+
         let _table_creation_permit =
             Arc::clone(&self.table_creation_slots).acquire_owned().await.map_err(|_| {
                 etl_error!(ErrorKind::InvalidState, "DuckLake table creation semaphore closed")
@@ -1409,6 +1422,7 @@ mod tests {
         config::catalog_conninfo_from_url,
         maintenance::flush_table_inlined_data,
         metrics::{query_catalog_maintenance_metrics, query_table_storage_metrics},
+        schema::{SortDirection, SortKey},
     };
 
     const POSTGRES_SCANNER_EXTENSION_FILE: &str = "postgres_scanner.duckdb_extension";
@@ -1917,5 +1931,106 @@ mod tests {
         assert!(metrics.files_scheduled_for_deletion_total >= 0);
         assert!(metrics.files_scheduled_for_deletion_bytes >= 0);
         assert!(metrics.oldest_scheduled_deletion_age_seconds >= 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_table_exists_does_not_rerun_storage_config_alter_on_restart() {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let data = path_to_file_url(&dir.path().join("data"));
+        let (_catalog_database, catalog) = create_catalog_database().await;
+        let store = MemoryStore::new();
+        let schema = make_schema(1, "public", "users");
+        let replicated_table_schema = ReplicatedTableSchema::all(Arc::new(schema.clone()));
+        let table_name = table_name_to_ducklake_table_name(&schema.name).unwrap();
+        store.store_table_schema(schema.clone()).await.expect("failed to seed schema");
+
+        let mut storage_config = HashMap::new();
+        storage_config.insert(
+            table_name.as_str().to_string(),
+            TableStorageConfig {
+                sort_keys: vec![SortKey {
+                    column: "id".to_string(),
+                    direction: SortDirection::Asc,
+                }],
+                partition_by: vec![],
+            },
+        );
+
+        let make_destination = || async {
+            DuckLakeDestination::new(
+                catalog.clone(),
+                data.clone(),
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                store.clone(),
+                storage_config.clone(),
+            )
+            .await
+            .expect("failed to create destination")
+        };
+
+        let destination = make_destination().await;
+        destination
+            .write_table_rows(
+                &replicated_table_schema,
+                vec![TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_string())])],
+            )
+            .await
+            .expect("failed to write rows on first run");
+        destination.shutdown().await.expect("failed to shutdown first destination");
+        drop(destination);
+
+        let metadata_pg_pool =
+            build_ducklake_metadata_pg_pool(&catalog).expect("failed to create metadata pool");
+        let conn = open_lake_conn_when_table_visible(&catalog, &data, &table_name).await;
+        let metadata_schema = resolve_ducklake_metadata_schema_blocking(&conn)
+            .expect("failed to resolve metadata schema");
+        drop(conn);
+
+        let count_inlined_versions = || async {
+            let row: (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*)::bigint FROM {}.ducklake_inlined_data_tables \
+                 WHERE table_id = (SELECT table_id FROM {}.ducklake_table \
+                 WHERE end_snapshot IS NULL AND table_name = $1 LIMIT 1)",
+                quote_identifier(&metadata_schema),
+                quote_identifier(&metadata_schema),
+            ))
+            .bind(table_name.as_str())
+            .fetch_one(&metadata_pg_pool)
+            .await
+            .expect("failed to count inlined data tables");
+            row.0
+        };
+
+        let versions_after_first_run = count_inlined_versions().await;
+        assert_eq!(
+            versions_after_first_run, 1,
+            "expected exactly 1 inlined data table after first destination run, got {versions_after_first_run}"
+        );
+
+        let destination = make_destination().await;
+        destination
+            .write_table_rows(
+                &replicated_table_schema,
+                vec![TableRow::new(vec![Cell::I32(2), Cell::String("bob".to_string())])],
+            )
+            .await
+            .expect("failed to write rows on second run");
+        destination.shutdown().await.expect("failed to shutdown second destination");
+        drop(destination);
+
+        let versions_after_restart = count_inlined_versions().await;
+        assert_eq!(
+            versions_after_restart, 1,
+            "restart must not bump schema_version: storage-config ALTERs should be skipped \
+             when applied destination metadata already exists, got {versions_after_restart}"
+        );
     }
 }
