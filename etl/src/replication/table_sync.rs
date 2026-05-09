@@ -193,24 +193,15 @@ where
                             let (truncate_result, pending_truncate_result) =
                                 TruncateTableResult::new(());
 
-                            if let Err(err) = destination
+                            // A failed truncate must abort the sync — proceeding would
+                            // append the COPY on top of pre-existing rows and silently
+                            // double the table. Surface the error so the outer pipeline
+                            // retries with capped backoff.
+                            destination
                                 .truncate_table(&replicated_table_schema, truncate_result)
-                                .await
-                            {
-                                warn!(
-                                    table_id = table_id.0,
-                                    error = %err,
-                                    "failed to dispatch destination table truncation before copy, continuing"
-                                );
-                            } else if let Err(err) = pending_truncate_result.await.into_result() {
-                                warn!(
-                                    table_id = table_id.0,
-                                    error = %err,
-                                    "failed to truncate destination table before copy, continuing"
-                                );
-                            } else {
-                                info!(%table_id, "truncated destination table before starting copy");
-                            }
+                                .await?;
+                            pending_truncate_result.await.into_result()?;
+                            info!(%table_id, "truncated destination table before starting copy");
                         } else {
                             bail!(
                                 ErrorKind::InvalidState,
