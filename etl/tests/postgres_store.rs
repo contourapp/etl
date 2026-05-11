@@ -112,6 +112,7 @@ async fn state_store_operations() {
         solution: Some("Test solution".to_string()),
         retry_policy: RetryPolicy::ManualRetry,
         source_err: etl_error!(ErrorKind::Unknown, "test error"),
+        errored_at_lsn: None,
     };
     store.update_table_replication_state(table_id, errored_phase.clone()).await.unwrap();
 
@@ -563,6 +564,7 @@ async fn errored_state_with_different_retry_policies() {
         solution: None,
         retry_policy: RetryPolicy::NoRetry,
         source_err: etl_error!(ErrorKind::Unknown, "test error"),
+        errored_at_lsn: None,
     };
     store.update_table_replication_state(table_id, errored_no_retry.clone()).await.unwrap();
 
@@ -576,6 +578,7 @@ async fn errored_state_with_different_retry_policies() {
         solution: Some("Wait and retry".to_string()),
         retry_policy: RetryPolicy::TimedRetry { next_retry },
         source_err: etl_error!(ErrorKind::Unknown, "test error"),
+        errored_at_lsn: Some("0/A000000".parse::<PgLsn>().unwrap()),
     };
     store.update_table_replication_state(table_id, errored_timed_retry.clone()).await.unwrap();
 

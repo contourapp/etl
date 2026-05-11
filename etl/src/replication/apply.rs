@@ -400,6 +400,19 @@ struct ApplyLoopState {
     /// can always resolve the latest schema version whose snapshot is less
     /// than or equal to the worker's start point.
     bootstrap_snapshot_id: SnapshotId,
+    /// Cached upper bound on the LSN that can be acknowledged to PostgreSQL.
+    ///
+    /// When any table is in the `Errored` phase with a captured
+    /// `errored_at_lsn`, this holds the `min(over errored tables,
+    /// errored_at_lsn)`. The slot ack is clamped to this value via
+    /// [`Self::effective_ack_lsn`] so that events past the errored point
+    /// are retained in PG's WAL until the table recovers, rather than
+    /// being silently lost at recovery time (when table_sync would
+    /// otherwise start a fresh COPY at a later consistent_point).
+    ///
+    /// `None` means no errored tables are contributing a hold-back, and
+    /// the slot ack proceeds normally.
+    errored_hold_back_lsn: Option<PgLsn>,
 }
 
 impl ApplyLoopState {
@@ -425,6 +438,7 @@ impl ApplyLoopState {
             exit_intent: None,
             processing_paused: false,
             bootstrap_snapshot_id,
+            errored_hold_back_lsn: None,
         }
     }
 
@@ -520,6 +534,24 @@ impl ApplyLoopState {
             self.replication_progress.last_received_lsn
         } else {
             self.replication_progress.last_flush_lsn
+        }
+    }
+
+    /// Returns the LSN that is safe to acknowledge to PostgreSQL.
+    ///
+    /// This is [`Self::effective_flush_lsn`] clamped by
+    /// [`Self::errored_hold_back_lsn`]. The clamp keeps PG from
+    /// recycling WAL past the position at which any table errored, so
+    /// when the table eventually recovers via a fresh `Init` → COPY
+    /// cycle the events that landed during the errored window remain
+    /// replayable rather than being silently dropped (they would
+    /// otherwise be invisible to the recovery COPY's consistent_point
+    /// snapshot and not present in the post-recovery CDC stream).
+    fn effective_ack_lsn(&self) -> PgLsn {
+        let flush_lsn = self.effective_flush_lsn();
+        match self.errored_hold_back_lsn {
+            Some(hold_back) if hold_back < flush_lsn => hold_back,
+            _ => flush_lsn,
         }
     }
 
@@ -753,6 +785,11 @@ where
         pin!(events_stream);
         let mut connection_updates_rx = replication_client.connection_updates_rx();
 
+        // Seed the slot-ack hold-back from any tables already in the
+        // `Errored` phase so the first status update we send doesn't
+        // race past them.
+        self.refresh_errored_hold_back().await?;
+
         loop {
             #[cfg(feature = "failpoints")]
             if matches!(self.state.shutdown_state, ShutdownState::WaitingForPrimaryKeepAlive { .. })
@@ -875,7 +912,7 @@ where
             _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::PeriodicKeepAlive,
                 )
@@ -941,7 +978,7 @@ where
             _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::PeriodicKeepAlive,
                 )
@@ -1012,7 +1049,7 @@ where
             _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::PeriodicKeepAlive,
                 )
@@ -1165,7 +1202,7 @@ where
 
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::KeepAlive,
                 )
@@ -1257,9 +1294,11 @@ where
     ) -> EtlResult<()> {
         let worker_type = self.worker_context.worker_type();
 
-        // Use effective flush LSN to report last received LSN when idle, since
-        // last flush LSN only advances during actual flushes.
-        let flush_lsn = self.state.effective_flush_lsn();
+        // Use effective ACK LSN to report last received LSN when idle, since
+        // last flush LSN only advances during actual flushes. The ACK LSN
+        // also respects any hold-back from errored tables so PG doesn't
+        // recycle WAL past their last-safe position even at shutdown.
+        let flush_lsn = self.state.effective_ack_lsn();
 
         info!(
             %worker_type,
@@ -1560,9 +1599,10 @@ where
 
                 self.send_status_update(
                     events_stream.as_mut(),
-                    // Use effective flush LSN to report last received LSN when idle, since
-                    // last flush LSN only advances during actual flushes.
-                    self.state.effective_flush_lsn(),
+                    // Use effective ACK LSN to report progress to PG. This clamps
+                    // by the errored-table hold-back so events on errored tables
+                    // are retained in WAL until recovery.
+                    self.state.effective_ack_lsn(),
                     message.reply() == 1,
                     StatusUpdateType::KeepAlive,
                 )
@@ -2213,11 +2253,19 @@ where
     /// Marks a table as errored.
     ///
     /// Dispatches to worker-specific implementation based on the worker
-    /// context.
+    /// context. Captures the current effective flush LSN onto the error
+    /// before persisting so the apply worker can hold back the slot ack
+    /// to `min(over errored tables, errored_at_lsn)` and avoid silently
+    /// abandoning events that would be missed by a fresh COPY at the
+    /// recovery consistent_point.
     async fn mark_table_errored(
         &mut self,
         table_replication_error: TableReplicationError,
     ) -> EtlResult<()> {
+        let errored_at_lsn = self.state.effective_flush_lsn();
+        let table_replication_error =
+            table_replication_error.with_errored_at_lsn(errored_at_lsn);
+
         let exit_intent = match &mut self.worker_context {
             WorkerContext::Apply(ctx) => {
                 apply_worker::mark_table_errored(ctx, table_replication_error).await
@@ -2229,6 +2277,34 @@ where
 
         self.state.record_exit_intent(exit_intent);
 
+        // Recompute the slot-ack hold-back so future status updates clamp
+        // to the new errored set.
+        self.refresh_errored_hold_back().await?;
+
+        Ok(())
+    }
+
+    /// Refreshes the cached slot-ack hold-back LSN by scanning the state
+    /// store for tables in the `Errored` phase that carry a captured
+    /// `errored_at_lsn`. The cache is `Some(min)` when at least one such
+    /// table exists, `None` otherwise.
+    async fn refresh_errored_hold_back(&mut self) -> EtlResult<()> {
+        let store = match &self.worker_context {
+            WorkerContext::Apply(ctx) => &ctx.store,
+            WorkerContext::TableSync(ctx) => &ctx.state_store,
+        };
+
+        let states = store.get_table_replication_states().await?;
+        let mut hold_back: Option<PgLsn> = None;
+        for phase in states.values() {
+            if let TableReplicationPhase::Errored { errored_at_lsn: Some(lsn), .. } = phase {
+                hold_back = Some(match hold_back {
+                    Some(current) => current.min(*lsn),
+                    None => *lsn,
+                });
+            }
+        }
+        self.state.errored_hold_back_lsn = hold_back;
         Ok(())
     }
 }

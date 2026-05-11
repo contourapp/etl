@@ -24,6 +24,12 @@ pub struct TableReplicationError {
     solution: Option<String>,
     retry_policy: RetryPolicy,
     source_err: EtlError,
+    /// LSN beyond which this table's CDC events are not safe to acknowledge
+    /// to PostgreSQL. Captured at error time so the apply worker can hold
+    /// back the replication slot ack and avoid permanently skipping events
+    /// that would otherwise be lost when the table recovers via a fresh
+    /// initial COPY at a later consistent_point.
+    errored_at_lsn: Option<PgLsn>,
 }
 
 impl TableReplicationError {
@@ -41,6 +47,7 @@ impl TableReplicationError {
             solution: Some(solution.to_string()),
             retry_policy,
             source_err: etl_error!(ErrorKind::Unknown, "table replication error", reason),
+            errored_at_lsn: None,
         }
     }
 
@@ -57,7 +64,21 @@ impl TableReplicationError {
             solution: None,
             retry_policy,
             source_err: etl_error!(ErrorKind::Unknown, "table replication error", reason),
+            errored_at_lsn: None,
         }
+    }
+
+    /// Returns a copy of the error with the provided LSN attached. The apply
+    /// worker uses this to hold back the slot ack so events on this table
+    /// past `lsn` are not abandoned.
+    pub fn with_errored_at_lsn(mut self, lsn: PgLsn) -> Self {
+        self.errored_at_lsn = Some(lsn);
+        self
+    }
+
+    /// Returns the captured errored-at LSN, if any.
+    pub fn errored_at_lsn(&self) -> Option<PgLsn> {
+        self.errored_at_lsn
     }
 
     /// Returns the [`TableId`] of the table that failed replication.
@@ -322,6 +343,14 @@ pub enum TableReplicationPhase {
         /// produced it.
         #[serde(skip, default = "default_source_err")]
         source_err: EtlError,
+        /// LSN beyond which this table's events are not safe to acknowledge
+        /// to PostgreSQL. The apply worker holds back the slot ack to
+        /// `min(over all errored tables, errored_at_lsn)` so that recovery
+        /// via a fresh COPY does not silently lose events that landed
+        /// while the table was errored. Optional for backward compatibility
+        /// with state rows persisted before this field existed.
+        #[serde(default, with = "optional_lsn_serde")]
+        errored_at_lsn: Option<PgLsn>,
     },
 }
 
@@ -428,6 +457,7 @@ impl From<TableReplicationError> for TableReplicationPhase {
             solution: value.solution,
             retry_policy: value.retry_policy,
             source_err: value.source_err,
+            errored_at_lsn: value.errored_at_lsn,
         }
     }
 }
@@ -541,6 +571,27 @@ mod lsn_serde {
     }
 }
 
+/// Serde helpers for an optional Postgres LSN serialized as its display form.
+mod optional_lsn_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tokio_postgres::types::PgLsn;
+
+    pub(super) fn serialize<S>(lsn: &Option<PgLsn>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        lsn.as_ref().map(|lsn| lsn.to_string()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<PgLsn>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        opt.map(|s| s.parse().map_err(|e| serde::de::Error::custom(format!("{e:?}")))).transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -601,6 +652,7 @@ mod tests {
             solution: Some("Test solution".to_string()),
             retry_policy: RetryPolicy::NoRetry,
             source_err: etl_error!(ErrorKind::Unknown, "test"),
+            errored_at_lsn: None,
         };
         let json = serde_json::to_value(&errored).unwrap();
         assert_eq!(
@@ -609,7 +661,8 @@ mod tests {
                 "type": "errored",
                 "reason": "Test error",
                 "solution": "Test solution",
-                "retry_policy": {"type": "no_retry"}
+                "retry_policy": {"type": "no_retry"},
+                "errored_at_lsn": null
             })
         );
         // source_err should NOT appear in the JSON
@@ -676,6 +729,7 @@ mod tests {
                 solution: Some("fix it".to_string()),
                 retry_policy: RetryPolicy::ManualRetry,
                 source_err: etl_error!(ErrorKind::Unknown, "test"),
+                errored_at_lsn: Some("0/3000000".parse::<PgLsn>().unwrap()),
             },
         ];
 
@@ -704,18 +758,21 @@ mod tests {
                         reason: r1,
                         solution: s1,
                         retry_policy: rp1,
+                        errored_at_lsn: lsn1,
                         ..
                     },
                     TableReplicationPhase::Errored {
                         reason: r2,
                         solution: s2,
                         retry_policy: rp2,
+                        errored_at_lsn: lsn2,
                         ..
                     },
                 ) => {
                     assert_eq!(r1, r2);
                     assert_eq!(s1, s2);
                     assert_eq!(rp1, rp2);
+                    assert_eq!(lsn1, lsn2);
                 }
                 _ => {}
             }
