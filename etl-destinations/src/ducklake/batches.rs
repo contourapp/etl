@@ -635,6 +635,27 @@ pub(super) fn prepare_copy_table_batch(
     table_rows: Vec<TableRow>,
 ) -> EtlResult<PreparedDuckLakeTableBatch> {
     let identity = build_copy_batch_identity(&table_name, replicated_table_schema, &table_rows)?;
+    let column_schemas: Vec<ColumnSchema> =
+        replicated_table_schema.column_schemas().cloned().collect();
+    let identity_columns: Vec<String> = replicated_table_schema
+        .identity_column_schemas()
+        .map(|col| quote_identifier(&col.name).into_owned())
+        .collect();
+
+    let mutation = if identity_columns.is_empty() {
+        PreparedTableMutation::Upsert(prepare_rows(table_rows, &column_schemas))
+    } else {
+        let all_columns: Vec<String> = replicated_table_schema
+            .column_schemas()
+            .map(|col| quote_identifier(&col.name).into_owned())
+            .collect();
+        PreparedTableMutation::Merge {
+            rows: prepare_rows(table_rows, &column_schemas),
+            identity_columns,
+            all_columns,
+        }
+    };
+
     Ok(PreparedDuckLakeTableBatch {
         table_name,
         batch_id: identity.batch_id,
@@ -643,12 +664,7 @@ pub(super) fn prepare_copy_table_batch(
         last_commit_lsn: identity.last_commit_lsn,
         first_sequence_key: None,
         last_sequence_key: None,
-        action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
-            prepare_rows(
-                table_rows,
-                &replicated_table_schema.column_schemas().cloned().collect::<Vec<_>>(),
-            ),
-        )]),
+        action: PreparedDuckLakeTableBatchAction::Mutation(vec![mutation]),
     })
 }
 
@@ -3090,5 +3106,39 @@ mod tests {
         );
 
         assert_ne!(first.batch_id, second.batch_id);
+    }
+
+    #[test]
+    fn prepare_copy_table_batch_uses_merge_when_identity_columns_present() {
+        let replicated_table_schema = make_replicated_schema();
+        let batch = prepare_copy_table_batch(
+            &replicated_table_schema,
+            "public_users".to_string(),
+            vec![
+                TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_string())]),
+                TableRow::new(vec![Cell::I32(2), Cell::String("bob".to_string())]),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(batch.batch_kind, DuckLakeTableBatchKind::Copy);
+        match &batch.action {
+            PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
+                assert_eq!(prepared.len(), 1);
+                match &prepared[0] {
+                    PreparedTableMutation::Merge {
+                        rows: PreparedRows::Appender(rows),
+                        identity_columns,
+                        all_columns,
+                    } => {
+                        assert_eq!(rows.len(), 2);
+                        assert!(!identity_columns.is_empty());
+                        assert!(!all_columns.is_empty());
+                    }
+                    other => panic!("expected Merge with appender, got {:?}", std::mem::discriminant(other)),
+                }
+            }
+            PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
+        }
     }
 }
