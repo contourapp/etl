@@ -1106,7 +1106,16 @@ fn prepare_table_mutations(
                         origin: "delete",
                     });
                 }
-                upsert_rows.push(row);
+                // Route Inserts through MERGE when the table has a replica
+                // identity so retried CDC events dedupe by primary key rather
+                // than landing as duplicate rows. Identity-less tables fall
+                // back to the blind-append path since MERGE has no key to
+                // join on.
+                if identity_columns.is_empty() {
+                    upsert_rows.push(row);
+                } else {
+                    merge_rows.push(row);
+                }
             }
             TableMutation::Delete(row) => {
                 if !upsert_rows.is_empty() {
@@ -1114,6 +1123,13 @@ fn prepare_table_mutations(
                         std::mem::take(&mut upsert_rows),
                         &column_schemas,
                     )));
+                }
+                if !merge_rows.is_empty() {
+                    prepared_mutations.push(PreparedTableMutation::Merge {
+                        rows: prepare_rows(std::mem::take(&mut merge_rows), &column_schemas),
+                        identity_columns: identity_columns.clone(),
+                        all_columns: all_columns.clone(),
+                    });
                 }
                 delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
             }
@@ -1123,6 +1139,13 @@ fn prepare_table_mutations(
                         std::mem::take(&mut upsert_rows),
                         &column_schemas,
                     )));
+                }
+                if !merge_rows.is_empty() {
+                    prepared_mutations.push(PreparedTableMutation::Merge {
+                        rows: prepare_rows(std::mem::take(&mut merge_rows), &column_schemas),
+                        identity_columns: identity_columns.clone(),
+                        all_columns: all_columns.clone(),
+                    });
                 }
                 if !delete_predicates.is_empty() {
                     prepared_mutations.push(PreparedTableMutation::Delete {
@@ -2549,7 +2572,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_mutation_table_batches_insert_only_uses_single_upsert_operation() {
+    fn prepare_mutation_table_batches_insert_only_uses_single_merge_operation() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
             &replicated_table_schema,
@@ -2583,15 +2606,21 @@ mod tests {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
+                    PreparedTableMutation::Merge {
+                        rows: PreparedRows::Appender(rows),
+                        identity_columns,
+                        all_columns,
+                    } => {
                         assert_eq!(rows.len(), 2);
+                        assert!(!identity_columns.is_empty());
+                        assert!(!all_columns.is_empty());
                     }
-                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_))
-                    | PreparedTableMutation::Merge { .. } => {
-                        panic!("expected appender payload")
+                    PreparedTableMutation::Merge { rows: PreparedRows::SqlLiterals(_), .. }
+                    | PreparedTableMutation::Upsert(_) => {
+                        panic!("expected merge with appender payload")
                     }
                     PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
-                        panic!("expected upsert")
+                        panic!("expected merge")
                     }
                 }
             }
@@ -2644,12 +2673,12 @@ mod tests {
                 assert_eq!(prepared.len(), 3);
                 assert!(matches!(
                     prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::Merge { rows: PreparedRows::Appender(_), .. }
                 ));
                 assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
                     prepared[2],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::Merge { rows: PreparedRows::Appender(_), .. }
                 ));
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
@@ -2870,7 +2899,7 @@ mod tests {
                 assert_eq!(prepared.len(), 4);
                 assert!(matches!(
                     prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::Merge { rows: PreparedRows::Appender(_), .. }
                 ));
                 assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
@@ -2879,7 +2908,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     prepared[3],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::Merge { rows: PreparedRows::Appender(_), .. }
                 ));
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
