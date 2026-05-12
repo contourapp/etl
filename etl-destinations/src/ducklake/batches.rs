@@ -2105,8 +2105,15 @@ fn apply_merge_mutation(
 
     let values =
         all_columns.iter().map(|col| format!("source.{col}")).collect::<Vec<_>>().join(", ");
+
+    // Deduplicate the staging table by identity columns before merging.
+    // Postgres logical replication provides at-least-once delivery: the same
+    // INSERT can arrive more than once after a walsender restart. Keeping only
+    // the last row per identity key (ORDER BY rowid DESC) prevents duplicate
+    // inserts while preserving CDC last-write-wins ordering.
+    let partition_by = identity_columns.join(", ");
     let sql = format!(
-        r#"MERGE INTO {LAKE_CATALOG}."{table}" AS target USING {staging:?} AS source ON ({on_clause}) WHEN MATCHED THEN UPDATE SET {set_clause} WHEN NOT MATCHED THEN INSERT VALUES ({values});"#,
+        r#"MERGE INTO {LAKE_CATALOG}."{table}" AS target USING (SELECT * FROM {staging:?} QUALIFY ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY rowid DESC) = 1) AS source ON ({on_clause}) WHEN MATCHED THEN UPDATE SET {set_clause} WHEN NOT MATCHED THEN INSERT VALUES ({values});"#,
         table = reusable_staging_table.table_name,
         staging = &reusable_staging_table.staging_name,
     );
