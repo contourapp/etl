@@ -67,8 +67,13 @@ const MAINTENANCE_PENDING_ROWS_THRESHOLD: Option<u64> = None;
 const MAINTENANCE_TABLE_COMPACTION_IDLE_THRESHOLD: Duration = Duration::from_secs(90);
 /// Minimum delay between targeted maintenance runs for the same table.
 const MAINTENANCE_TABLE_COMPACTION_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Keeps the legacy targeted rewrite path compiled without scheduling it.
-const ENABLE_TARGETED_TABLE_MAINTENANCE: bool = false;
+/// Whether to run targeted table maintenance (ducklake_rewrite_data_files).
+/// Defaults to true; set DUCKLAKE_ENABLE_COMPACTION=false to disable at runtime.
+fn enable_targeted_table_maintenance() -> bool {
+    std::env::var("DUCKLAKE_ENABLE_COMPACTION")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
 /// Minimum active delete-file count before idle rewrite is worth attempting.
 const MAINTENANCE_IDLE_REWRITE_DELETE_FILES_THRESHOLD: i64 = 32;
 /// Deleted-row ratio that makes idle rewrite worthwhile.
@@ -895,7 +900,7 @@ async fn run_ducklake_maintenance_worker(
                     }
                     now = Instant::now();
 
-                    if !ENABLE_TARGETED_TABLE_MAINTENANCE {
+                    if !enable_targeted_table_maintenance() {
                         continue;
                     }
 
