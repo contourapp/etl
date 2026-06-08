@@ -324,6 +324,18 @@ fn cell_to_sql_literal_typed(cell: &Cell, typ: &Type) -> String {
             return match cell {
                 Cell::Null => "NULL".to_owned(),
                 Cell::String(s) => range_array_text_to_list_literal(s, bound_type),
+                // CDC decodes tstzrange[] as ArrayCell::String where each
+                // element is a single range text like "[lower,upper)".
+                Cell::Array(ArrayCell::String(elements)) => {
+                    let structs: Vec<String> = elements
+                        .iter()
+                        .map(|elem| match elem {
+                            Some(s) => range_text_to_struct_literal(s, bound_type),
+                            None => "NULL".to_owned(),
+                        })
+                        .collect();
+                    format!("[{}]", structs.join(", "))
+                }
                 other => cell_to_sql_literal_ref(other),
             };
         }
