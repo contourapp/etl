@@ -351,7 +351,10 @@ fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
     }
 
     let inner = &trimmed[1..trimmed.len() - 1];
-    let (lower, upper) = match inner.split_once(',') {
+    // Postgres quotes range bounds containing spaces (e.g. timestamps):
+    // ["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")
+    // Use quote-aware splitting then strip the surrounding quotes.
+    let (lower, upper) = match split_range_bounds(inner) {
         Some(parts) => parts,
         None => return "NULL".to_owned(),
     };
@@ -359,15 +362,43 @@ fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
     let lower_literal = if lower.is_empty() {
         "NULL".to_owned()
     } else {
-        format_typed_literal(lower, bound_type)
+        format_typed_literal(&lower, bound_type)
     };
     let upper_literal = if upper.is_empty() {
         "NULL".to_owned()
     } else {
-        format_typed_literal(upper, bound_type)
+        format_typed_literal(&upper, bound_type)
     };
 
     format!("{{'lower': {lower_literal}, 'upper': {upper_literal}}}")
+}
+
+/// Splits the interior of a Postgres range into (lower, upper) bounds,
+/// handling double-quoted values that may contain commas.
+/// Input example: `"2026-01-28 01:17:00+00","2026-01-28 05:25:00+00"`
+/// Returns unquoted bound strings.
+fn split_range_bounds(inner: &str) -> Option<(String, String)> {
+    if inner.starts_with('"') {
+        // Quoted lower bound — find the closing quote, then expect a comma.
+        let rest = &inner[1..];
+        let close = rest.find('"')?;
+        let lower = &rest[..close];
+        let after = &rest[close + 1..];
+        if after.is_empty() {
+            // Unbounded upper: e.g. `"value",)`  but inner is `"value"`
+            return Some((lower.to_owned(), String::new()));
+        }
+        let after = after.strip_prefix(',')?;
+        let upper = after.trim_matches('"');
+        Some((lower.to_owned(), upper.to_owned()))
+    } else {
+        // Unquoted lower bound — simple comma split.
+        let (lower, upper) = inner.split_once(',')?;
+        Some((
+            lower.trim_matches('"').to_owned(),
+            upper.trim_matches('"').to_owned(),
+        ))
+    }
 }
 
 /// Parses Postgres range array text (e.g. `{"[1,2)","[3,4)"}`) into a DuckDB list-of-struct literal.
