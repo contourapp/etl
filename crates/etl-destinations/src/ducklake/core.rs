@@ -59,7 +59,8 @@ use crate::{
             format_query_error_detail, run_duckdb_blocking,
         },
         config::{
-            MAINTENANCE_TARGET_FILE_SIZE, MIN_EXPIRE_SNAPSHOTS_OLDER_THAN, build_setup_plan,
+            MAINTENANCE_TARGET_FILE_SIZE, MIN_EXPIRE_SNAPSHOTS_OLDER_THAN,
+            build_setup_plan_with_memory_limit,
             current_duckdb_extension_strategy, maintenance_target_file_size_sql,
             resolve_expire_snapshots_older_than, validate_expire_snapshots_older_than_sql,
         },
@@ -897,6 +898,37 @@ where
             pool_size,
             s3,
             metadata_schema,
+            None,
+            maintenance_target_file_size,
+            expire_snapshots_older_than,
+            DuckLakeExternalMaintenanceConfig::default(),
+            store,
+            tables,
+        )
+        .await
+    }
+
+    /// Creates a new DuckLake destination with an explicit DuckDB memory limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_memory_limit(
+        catalog_url: Url,
+        data_path: Url,
+        pool_size: u32,
+        s3: Option<S3Config>,
+        metadata_schema: Option<String>,
+        duckdb_memory_limit: Option<String>,
+        maintenance_target_file_size: Option<String>,
+        expire_snapshots_older_than: Option<String>,
+        store: S,
+        tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
+    ) -> EtlResult<Self> {
+        Self::new_with_external_maintenance(
+            catalog_url,
+            data_path,
+            pool_size,
+            s3,
+            metadata_schema,
+            duckdb_memory_limit,
             maintenance_target_file_size,
             expire_snapshots_older_than,
             DuckLakeExternalMaintenanceConfig::default(),
@@ -915,6 +947,7 @@ where
         pool_size: u32,
         s3: Option<S3Config>,
         metadata_schema: Option<String>,
+        duckdb_memory_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
@@ -952,11 +985,26 @@ where
         {
             info!(platform = platform_dir, "using vendored duckdb extensions");
         }
-        let setup_plan = Arc::new(build_setup_plan(
+        // Contour: validate memory_limit before it reaches the setup plan SQL.
+        if let Some(ref memory_limit) = duckdb_memory_limit {
+            if !memory_limit
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'.')
+            {
+                return Err(etl_error!(
+                    ErrorKind::ConfigError,
+                    "Invalid duckdb_memory_limit value",
+                    format!("memory_limit `{memory_limit}` contains disallowed characters")
+                ));
+            }
+        }
+
+        let setup_plan = Arc::new(build_setup_plan_with_memory_limit(
             &catalog_url,
             &data_path,
             s3.as_ref(),
             metadata_schema.as_deref(),
+            duckdb_memory_limit.as_deref(),
         )?);
 
         let manager = Arc::new(DuckLakeConnectionManager {

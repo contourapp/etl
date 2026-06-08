@@ -583,6 +583,18 @@ pub(super) fn build_setup_plan(
     s3: Option<&S3Config>,
     metadata_schema: Option<&str>,
 ) -> EtlResult<DuckLakeSetupPlan> {
+    build_setup_plan_with_memory_limit(catalog_url, data_path, s3, metadata_schema, None)
+}
+
+/// Builds setup phases with an optional DuckDB memory limit applied to every
+/// connection.
+pub(super) fn build_setup_plan_with_memory_limit(
+    catalog_url: &Url,
+    data_path: &Url,
+    s3: Option<&S3Config>,
+    metadata_schema: Option<&str>,
+    duckdb_memory_limit: Option<&str>,
+) -> EtlResult<DuckLakeSetupPlan> {
     let strategy = current_duckdb_extension_strategy()?;
     let vendored_root = match strategy {
         DuckDbExtensionStrategy::VendoredLocal { platform_dir } => {
@@ -600,6 +612,7 @@ pub(super) fn build_setup_plan(
         data_path,
         s3,
         metadata_schema,
+        duckdb_memory_limit,
         strategy,
         vendored_root.as_deref(),
     )
@@ -619,6 +632,7 @@ fn build_setup_sql_with_strategy(
         data_path,
         s3,
         metadata_schema,
+        None,
         strategy,
         vendored_root,
     )?
@@ -630,6 +644,7 @@ fn build_setup_plan_with_strategy(
     data_path: &Url,
     s3: Option<&S3Config>,
     metadata_schema: Option<&str>,
+    duckdb_memory_limit: Option<&str>,
     strategy: DuckDbExtensionStrategy,
     vendored_root: Option<&Path>,
 ) -> EtlResult<DuckLakeSetupPlan> {
@@ -639,10 +654,20 @@ fn build_setup_plan_with_strategy(
     let needs_postgres = matches!(catalog_url.scheme(), "postgres" | "postgresql");
     let needs_httpfs = matches!(data_path.split(':').next(), Some("s3" | "gs"));
     let lake_catalog = quote_identifier(LAKE_CATALOG);
-    let mut steps = vec![DuckLakeSetupStep {
+    let mut steps = Vec::new();
+
+    // Contour: cap DuckDB memory when running multiple per-org pipelines.
+    if let Some(limit) = duckdb_memory_limit {
+        steps.push(DuckLakeSetupStep {
+            label: "configure_memory_limit",
+            sql: format!("SET memory_limit = '{limit}';"),
+        });
+    }
+
+    steps.push(DuckLakeSetupStep {
         label: "configure_writer_session",
         sql: configure_writer_session_sql(),
-    }];
+    });
     let mut secret_options = BTreeMap::from([
         ("KEY_ID", quote_literal(s3.map(|s| s.access_key_id.as_str()).unwrap_or_default())),
         ("REGION", quote_literal(s3.map(|s| s.region.as_str()).unwrap_or_default())),

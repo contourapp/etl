@@ -250,6 +250,7 @@ mod ducklake {
             *pool_size,
             s3_config,
             metadata_schema.clone(),
+            None, // duckdb_memory_limit: managed by upstream infrastructure
             maintenance_target_file_size.clone(),
             expire_snapshots_older_than.clone(),
             external_maintenance,

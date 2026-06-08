@@ -97,7 +97,9 @@ base64 = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"] }
 clickhouse = { workspace = true, optional = true, features = ["inserter", "lz4", "rustls-tls"] }
-duckdb = { workspace = true, optional = true, features = ["bundled", "json", "parquet", "r2d2"] }
+# Contour: use only `r2d2` — `json` and `parquet` features imply `bundled` which
+# compiles DuckDB from C++ source (~10 min). Pre-built binary is used without them.
+duckdb = { workspace = true, optional = true, features = ["r2d2"] }
 etl = { workspace = true }
 etl-config = { workspace = true }
 etl-maintenance = { workspace = true, optional = true }

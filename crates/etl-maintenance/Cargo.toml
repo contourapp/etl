@@ -29,7 +29,8 @@ test-utils = []
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
-duckdb = { workspace = true, optional = true, features = ["bundled", "json", "parquet", "r2d2"] }
+# Contour: use only `r2d2` — `json` and `parquet` features imply `bundled`.
+duckdb = { workspace = true, optional = true, features = ["r2d2"] }
 etl = { workspace = true }
 kube = { workspace = true, optional = true, features = ["client", "rustls-tls"] }
 metrics = { workspace = true, optional = true }
