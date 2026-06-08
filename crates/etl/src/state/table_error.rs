@@ -2,6 +2,7 @@ use crate::{
     error::{ErrorKind, EtlError},
     etl_error,
     state::TableRetryPolicy,
+    types::PgLsn,
     workers::ErrorHandlingPolicy,
 };
 
@@ -14,6 +15,8 @@ pub struct TableError {
     pub(super) reason: String,
     pub(super) solution: Option<String>,
     pub(super) retry_policy: TableRetryPolicy,
+    /// LSN at which the error occurred, used for slot ack hold-back.
+    pub(super) errored_at_lsn: Option<PgLsn>,
     pub(super) source_err: EtlError,
 }
 
@@ -29,6 +32,7 @@ impl TableError {
             reason: reason.clone(),
             solution: Some(solution.to_string()),
             retry_policy,
+            errored_at_lsn: None,
             source_err: etl_error!(ErrorKind::Unknown, "Table replication error", reason),
         }
     }
@@ -40,6 +44,7 @@ impl TableError {
             reason: reason.clone(),
             solution: None,
             retry_policy,
+            errored_at_lsn: None,
             source_err: etl_error!(ErrorKind::Unknown, "Table replication error", reason),
         }
     }
@@ -68,6 +73,12 @@ impl TableError {
             }
             None => Self::without_solution(error, retry_policy).with_source_err(error.clone()),
         }
+    }
+
+    /// Sets the LSN at which the error occurred for slot ack hold-back.
+    pub fn with_errored_at_lsn(mut self, lsn: PgLsn) -> Self {
+        self.errored_at_lsn = Some(lsn);
+        self
     }
 
     /// Returns a copy of the error with the provided source error attached.

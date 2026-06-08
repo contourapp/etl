@@ -52,6 +52,7 @@ pub static ETL_API_OPTIONS: LazyLock<PgConnectionOptions> = LazyLock::new(|| PgC
     lock_timeout: 5_000,
     idle_in_transaction_session_timeout: 60_000,
     application_name: APP_NAME_API.to_owned(),
+    wal_sender_timeout: 0,
 });
 
 /// Connection options for database migrations.
@@ -70,6 +71,7 @@ pub static ETL_MIGRATION_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 10_000,
         idle_in_transaction_session_timeout: 60_000,
         application_name: APP_NAME_REPLICATOR_MIGRATIONS.to_owned(),
+        wal_sender_timeout: 0,
     });
 
 /// Connection options for logical replication streams.
@@ -93,6 +95,8 @@ pub static ETL_REPLICATION_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 0,
         idle_in_transaction_session_timeout: 0,
         application_name: APP_NAME_REPLICATOR_STREAMING.to_owned(),
+        // Contour: 30 minutes to avoid premature disconnection during large loads.
+        wal_sender_timeout: 1_800_000,
     });
 
 /// Connection options for accessing ETL state metadata in the source database.
@@ -110,6 +114,7 @@ pub static ETL_STATE_MANAGEMENT_OPTIONS: LazyLock<PgConnectionOptions> =
         lock_timeout: 10_000,
         idle_in_transaction_session_timeout: 60_000,
         application_name: APP_NAME_REPLICATOR_STATE.to_owned(),
+        wal_sender_timeout: 0,
     });
 
 /// Postgres server options for ETL workloads.
@@ -140,6 +145,9 @@ pub struct PgConnectionOptions {
     /// Sets the application name to be reported in statistics views and logs
     /// for connection identification.
     pub application_name: String,
+    /// Overrides the server's `wal_sender_timeout` for this session (ms).
+    /// When zero the server default is kept.
+    pub wal_sender_timeout: u32,
 }
 
 impl PgConnectionOptions {
@@ -148,7 +156,7 @@ impl PgConnectionOptions {
     /// Returns space-separated `-c key=value` pairs suitable for the options
     /// parameter.
     pub fn to_options_string(&self) -> String {
-        format!(
+        let mut s = format!(
             "-c datestyle={} -c intervalstyle={} -c extra_float_digits={} -c client_encoding={} \
              -c timezone={} -c statement_timeout={} -c lock_timeout={} -c \
              idle_in_transaction_session_timeout={} -c application_name={}",
@@ -161,14 +169,18 @@ impl PgConnectionOptions {
             self.lock_timeout,
             self.idle_in_transaction_session_timeout,
             self.application_name
-        )
+        );
+        if self.wal_sender_timeout > 0 {
+            s.push_str(&format!(" -c wal_sender_timeout={}", self.wal_sender_timeout));
+        }
+        s
     }
 
     /// Formats options as key-value pairs for sqlx connection.
     ///
     /// Returns a vector of (key, value) tuples suitable for sqlx configuration.
     pub fn to_key_value_pairs(&self) -> Vec<(String, String)> {
-        vec![
+        let mut pairs = vec![
             ("datestyle".to_owned(), self.datestyle.clone()),
             ("intervalstyle".to_owned(), self.intervalstyle.clone()),
             ("extra_float_digits".to_owned(), self.extra_float_digits.to_string()),
@@ -181,7 +193,11 @@ impl PgConnectionOptions {
                 self.idle_in_transaction_session_timeout.to_string(),
             ),
             ("application_name".to_owned(), self.application_name.clone()),
-        ]
+        ];
+        if self.wal_sender_timeout > 0 {
+            pairs.push(("wal_sender_timeout".to_owned(), self.wal_sender_timeout.to_string()));
+        }
+        pairs
     }
 }
 
@@ -446,7 +462,7 @@ mod tests {
             "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3 -c \
              client_encoding=UTF8 -c timezone=UTC -c statement_timeout=0 -c lock_timeout=0 -c \
              idle_in_transaction_session_timeout=0 -c \
-             application_name=supabase_etl_replicator_streaming"
+             application_name=supabase_etl_replicator_streaming -c wal_sender_timeout=1800000"
         );
     }
 

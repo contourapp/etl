@@ -389,6 +389,8 @@ struct ApplyLoopState {
     bootstrap_snapshot_id: SnapshotId,
     /// Replication slot name used by this loop.
     slot_name: String,
+    /// Minimum LSN across all errored tables, used to hold back slot ack.
+    errored_hold_back_lsn: Option<PgLsn>,
     /// Shared schema cleanup deadline.
     ///
     /// `None` means a cleanup run has claimed the deadline. The run resets this
@@ -423,6 +425,7 @@ impl ApplyLoopState {
             processing_paused: false,
             bootstrap_snapshot_id,
             slot_name,
+            errored_hold_back_lsn: None,
             schema_cleanup_deadline: Arc::new(Mutex::new(Some(
                 Instant::now() + SCHEMA_CLEANUP_INTERVAL,
             ))),
@@ -534,6 +537,14 @@ impl ApplyLoopState {
             self.replication_progress.last_received_lsn
         } else {
             self.replication_progress.last_flush_lsn
+        }
+    }
+
+    /// Returns the LSN to report to PostgreSQL, clamped by errored-table hold-back.
+    fn effective_ack_lsn(&self) -> PgLsn {
+        match self.errored_hold_back_lsn {
+            Some(hold_back) => std::cmp::min(self.effective_flush_lsn(), hold_back),
+            None => self.effective_flush_lsn(),
         }
     }
 
@@ -830,6 +841,9 @@ where
         pin!(events_stream);
         let mut connection_updates_rx = replication_client.connection_updates_rx();
 
+        // Contour: seed hold-back from any previously-errored tables.
+        self.refresh_errored_hold_back().await?;
+
         loop {
             let iteration_result = match &self.state.shutdown_state {
                 ShutdownState::NoShutdown => {
@@ -949,7 +963,7 @@ where
             _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::PeriodicKeepAlive,
                 )
@@ -1014,7 +1028,7 @@ where
             _ = Self::wait_for_keep_alive_deadline(self.state.keep_alive_deadline) => {
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     true,
                     StatusUpdateType::PeriodicKeepAlive,
                 )
@@ -1181,7 +1195,7 @@ where
     ) -> EtlResult<()> {
         let worker_type = self.worker_context.worker_type();
 
-        let flush_lsn = self.state.effective_flush_lsn();
+        let flush_lsn = self.state.effective_ack_lsn();
 
         info!(
             %worker_type,
@@ -1718,7 +1732,7 @@ where
 
                 self.send_status_update(
                     events_stream.as_mut(),
-                    self.state.effective_flush_lsn(),
+                    self.state.effective_ack_lsn(),
                     message.reply() == 1,
                     StatusUpdateType::KeepAlive,
                 )
@@ -2396,6 +2410,40 @@ where
 
         self.state.record_exit_intent(exit_intent);
 
+        // Contour: refresh hold-back after table sync may have errored tables.
+        self.refresh_errored_hold_back().await?;
+
+        Ok(())
+    }
+
+    /// Recomputes the errored-table hold-back LSN from the state store.
+    ///
+    /// If any table is in an errored state, holds back slot ack to the minimum
+    /// of the current flush position and any previously computed hold-back.
+    /// Clears the hold-back once no tables are errored.
+    async fn refresh_errored_hold_back(&mut self) -> EtlResult<()> {
+        let store = match &self.worker_context {
+            WorkerContext::Apply(ctx) => &ctx.store,
+            WorkerContext::TableSync(ctx) => &ctx.state_store,
+        };
+        let states = store.get_table_states().await?;
+        let has_errored = states.iter().any(|(_, state)| state.is_errored());
+
+        if has_errored {
+            // Use explicit errored_at_lsn when available, otherwise the
+            // current flush position is a conservative bound.
+            let explicit_min = states
+                .iter()
+                .filter_map(|(_, state)| state.errored_at_lsn())
+                .min();
+            let bound = explicit_min.unwrap_or(self.state.effective_flush_lsn());
+            self.state.errored_hold_back_lsn = Some(match self.state.errored_hold_back_lsn {
+                Some(existing) => std::cmp::min(existing, bound),
+                None => bound,
+            });
+        } else {
+            self.state.errored_hold_back_lsn = None;
+        }
         Ok(())
     }
 }

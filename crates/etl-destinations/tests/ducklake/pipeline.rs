@@ -3,6 +3,8 @@
 //! These tests use a PostgreSQL-backed DuckLake catalog and verify the final
 //! table contents by querying DuckLake directly through DuckDB.
 
+use std::collections::HashMap;
+
 use duckdb::Connection;
 use etl::{
     state::TableStateType,
@@ -335,6 +337,7 @@ async fn build_destination(
         None,
         None,
         store,
+        HashMap::new(),
     )
     .await
     .expect("failed to create DuckLake destination");

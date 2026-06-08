@@ -113,6 +113,7 @@ async fn state_store_operations() {
         reason: "Test error".to_owned(),
         solution: Some("Test solution".to_owned()),
         retry_policy: TableRetryPolicy::ManualRetry,
+        errored_at_lsn: None,
         source_err: etl_error!(ErrorKind::Unknown, "Test error"),
     };
     store.update_table_state(table_id, errored_state.clone()).await.unwrap();
@@ -762,6 +763,7 @@ async fn errored_state_with_different_retry_policies() {
         reason: "Fatal error".to_owned(),
         solution: None,
         retry_policy: TableRetryPolicy::NoRetry,
+        errored_at_lsn: None,
         source_err: etl_error!(ErrorKind::Unknown, "Test error"),
     };
     store.update_table_state(table_id, errored_no_retry.clone()).await.unwrap();
@@ -775,6 +777,7 @@ async fn errored_state_with_different_retry_policies() {
         reason: "Temporary error".to_owned(),
         solution: Some("Wait and retry".to_owned()),
         retry_policy: TableRetryPolicy::TimedRetry { next_retry },
+        errored_at_lsn: None,
         source_err: etl_error!(ErrorKind::Unknown, "Test error"),
     };
     store.update_table_state(table_id, errored_timed_retry.clone()).await.unwrap();

@@ -136,6 +136,8 @@ pub enum ErrorKind {
     StateRollbackError,
 
     // Replication Errors
+    /// Transient Postgres failure (SYSTEM_ERROR / INTERNAL_ERROR).
+    SourceTransientFailure,
     ReplicationSlotNotFound,
     ReplicationSlotAlreadyExists,
     ReplicationSlotNotCreated,
@@ -667,8 +669,9 @@ impl From<tokio_postgres::Error> for EtlError {
                     }
 
                     // System errors (58xxx, XX xxx)
+                    // Contour: auto-retry transient Postgres failures.
                     SqlState::SYSTEM_ERROR | SqlState::INTERNAL_ERROR => {
-                        (ErrorKind::SourceQueryFailed, "PostgreSQL system error")
+                        (ErrorKind::SourceTransientFailure, "PostgreSQL system error")
                     }
                     SqlState::IO_ERROR => (ErrorKind::SourceIoError, "PostgreSQL I/O error"),
 

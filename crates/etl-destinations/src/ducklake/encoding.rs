@@ -1,7 +1,9 @@
 use chrono::{NaiveDate, NaiveTime};
 use duckdb::types::{TimeUnit, Value};
-use etl::types::{ArrayCell, Cell, TableRow};
+use etl::types::{ArrayCell, Cell, ColumnSchema, TableRow, Type, is_range_array_type, is_range_type};
 use pg_escape::quote_literal;
+
+use crate::ducklake::schema::duckdb_range_bound_type;
 
 /// Prepared row payload reused across retry attempts.
 pub(super) enum PreparedRows {
@@ -10,10 +12,24 @@ pub(super) enum PreparedRows {
 }
 
 /// Converts table rows into a retryable payload for DuckDB writes.
-pub(super) fn prepare_rows(table_rows: Vec<TableRow>) -> PreparedRows {
-    if table_rows.iter().any(|row| row.values().iter().any(cell_requires_sql_literals)) {
+pub(super) fn prepare_rows(
+    table_rows: Vec<TableRow>,
+    column_schemas: &[ColumnSchema],
+) -> PreparedRows {
+    let has_ranges = column_schemas
+        .iter()
+        .any(|c| is_range_type(&c.typ) || is_range_array_type(&c.typ));
+
+    if has_ranges
+        || table_rows
+            .iter()
+            .any(|row| row.values().iter().any(cell_requires_sql_literals))
+    {
         return PreparedRows::SqlLiterals(
-            table_rows.into_iter().map(table_row_to_sql_literal).collect(),
+            table_rows
+                .into_iter()
+                .map(|row| table_row_to_sql_literal_typed(&row, column_schemas))
+                .collect(),
         );
     }
 
@@ -37,12 +53,7 @@ pub(super) fn cell_to_sql_literal_ref(cell: &Cell) -> String {
 
 /// Returns whether a cell must bypass the DuckDB appender path.
 fn cell_requires_sql_literals(cell: &Cell) -> bool {
-    matches!(cell, Cell::Array(_))
-}
-
-/// Serializes a row into a SQL `VALUES (...)` tuple.
-fn table_row_to_sql_literal(row: TableRow) -> String {
-    table_row_to_sql_literal_ref(&row)
+    matches!(cell, Cell::Array(_) | Cell::Numeric(_))
 }
 
 /// Converts a [`Cell`] into a DuckDB SQL literal expression.
@@ -63,7 +74,7 @@ fn cell_to_sql_literal(cell: Cell) -> String {
         Cell::I64(i) => i.to_string(),
         Cell::F32(f) => float_literal(f as f64, false),
         Cell::F64(f) => float_literal(f, true),
-        Cell::Numeric(n) => quote_literal(&n.to_string()),
+        Cell::Numeric(n) => numeric_to_decimal_literal(&n),
         Cell::Date(d) => format!("DATE '{}'", d.format("%Y-%m-%d")),
         Cell::Time(t) => format!("TIME '{}'", t.format("%H:%M:%S%.6f")),
         Cell::Timestamp(dt) => {
@@ -266,6 +277,130 @@ fn float_literal(value: f64, is_double: bool) -> String {
     value.to_string()
 }
 
+/// Formats a CAST literal for parameterized types like DECIMAL.
+fn format_typed_literal(value: &str, sql_type: &str) -> String {
+    format!("CAST('{}' AS {})", value.replace('\'', "''"), sql_type)
+}
+
+/// Converts a PgNumeric to a DECIMAL(38,10) SQL literal, coercing NaN/Infinity to NULL.
+fn numeric_to_decimal_literal(n: &etl::types::PgNumeric) -> String {
+    use etl::types::PgNumeric;
+    match n {
+        PgNumeric::NaN | PgNumeric::PositiveInfinity | PgNumeric::NegativeInfinity => {
+            "NULL".to_owned()
+        }
+        PgNumeric::Value { .. } => format_typed_literal(&n.to_string(), "DECIMAL(38, 10)"),
+    }
+}
+
+/// Serializes a row using column type info for range-aware encoding.
+fn table_row_to_sql_literal_typed(row: &TableRow, column_schemas: &[ColumnSchema]) -> String {
+    let values: Vec<String> = row
+        .values()
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            if let Some(schema) = column_schemas.get(i) {
+                cell_to_sql_literal_typed(cell, &schema.typ)
+            } else {
+                cell_to_sql_literal_ref(cell)
+            }
+        })
+        .collect();
+    format!("({})", values.join(", "))
+}
+
+/// Encodes a cell using column type info for range-aware conversion.
+fn cell_to_sql_literal_typed(cell: &Cell, typ: &Type) -> String {
+    if let Some(bound_type) = duckdb_range_bound_type(typ) {
+        if is_range_type(typ) {
+            return match cell {
+                Cell::Null => "NULL".to_owned(),
+                Cell::String(s) => range_text_to_struct_literal(s, bound_type),
+                other => cell_to_sql_literal_ref(other),
+            };
+        }
+        if is_range_array_type(typ) {
+            return match cell {
+                Cell::Null => "NULL".to_owned(),
+                Cell::String(s) => range_array_text_to_list_literal(s, bound_type),
+                other => cell_to_sql_literal_ref(other),
+            };
+        }
+    }
+    cell_to_sql_literal_ref(cell)
+}
+
+/// Parses Postgres range text (e.g. `[2024-01-01,2024-12-31)`) into a DuckDB STRUCT literal.
+fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed == "empty" || trimmed.is_empty() {
+        return "NULL".to_owned();
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let (lower, upper) = match inner.split_once(',') {
+        Some(parts) => parts,
+        None => return "NULL".to_owned(),
+    };
+
+    let lower_literal = if lower.is_empty() {
+        "NULL".to_owned()
+    } else {
+        format_typed_literal(lower, bound_type)
+    };
+    let upper_literal = if upper.is_empty() {
+        "NULL".to_owned()
+    } else {
+        format_typed_literal(upper, bound_type)
+    };
+
+    format!("{{'lower': {lower_literal}, 'upper': {upper_literal}}}")
+}
+
+/// Parses Postgres range array text (e.g. `{"[1,2)","[3,4)"}`) into a DuckDB list-of-struct literal.
+fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return "[]".to_owned();
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let elements: Vec<String> = split_pg_array_elements(inner)
+        .iter()
+        .map(|elem| {
+            let unquoted = elem.trim_matches('"');
+            range_text_to_struct_literal(unquoted, bound_type)
+        })
+        .collect();
+
+    format!("[{}]", elements.join(", "))
+}
+
+/// Quote-aware comma splitting for Postgres array interior strings.
+fn split_pg_array_elements(s: &str) -> Vec<String> {
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ',' if !in_quotes => {
+                elements.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        elements.push(current);
+    }
+    elements
+}
+
 /// Encodes bytes as uppercase hexadecimal for DuckDB's `from_hex`.
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
@@ -287,7 +422,7 @@ fn cell_to_value(cell: Cell) -> Value {
         Cell::I64(i) => Value::BigInt(i),
         Cell::F32(f) => Value::Float(f),
         Cell::F64(f) => Value::Double(f),
-        // NUMERIC stored as VARCHAR to avoid precision loss.
+        // Numeric goes through SQL literal path (cell_requires_sql_literals); this arm is fallback.
         Cell::Numeric(n) => Value::Text(n.to_string()),
         Cell::Date(d) => Value::Date32(d.signed_duration_since(epoch_date).num_days() as i32),
         Cell::Time(t) => {
@@ -408,10 +543,17 @@ mod tests {
 
     #[test]
     fn prepare_rows_uses_sql_literals_for_arrays() {
-        let prepared = prepare_rows(vec![TableRow::new(vec![
-            Cell::I32(1),
-            Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)])),
-        ])]);
+        let schemas = vec![
+            ColumnSchema::new("id".to_owned(), Type::INT4, -1, 1, Some(1), false),
+            ColumnSchema::new("arr".to_owned(), Type::INT4_ARRAY, -1, 2, None, true),
+        ];
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![
+                Cell::I32(1),
+                Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)])),
+            ])],
+            &schemas,
+        );
 
         match prepared {
             PreparedRows::SqlLiterals(rows) => {

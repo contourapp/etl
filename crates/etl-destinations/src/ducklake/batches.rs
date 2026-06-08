@@ -68,14 +68,15 @@ const SQL_INSERT_BATCH_SIZE: usize = 128;
 ///
 /// Keep this small so each delete statement remains cheap while still avoiding
 /// one round-trip per deleted row.
-const SQL_DELETE_BATCH_SIZE: usize = 16;
+// Contour: larger batches reduce round-trips for high-throughput CDC.
+const SQL_DELETE_BATCH_SIZE: usize = 64;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
 /// Keeping mixed insert/delete/update streams in the same batch improves
 /// insert throughput on interleaved workloads while still capping transaction
 /// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 16;
+const CDC_MUTATION_BATCH_SIZE: usize = 128;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Inline small marker-table writes in the DuckLake metadata catalog instead of
@@ -172,17 +173,23 @@ pub(super) enum TableMutation {
 enum PreparedTableMutation {
     Upsert(PreparedRows),
     Delete {
-        // For WHERE clause predicates used in DELETE statements.
         predicates: Vec<String>,
-        // To know if it's coming from an update or delete operation.
         origin: &'static str,
     },
     Update {
-        // For SET clause assignments used in UPDATE statements. Example: "value=1, id=3"
         assignments: Vec<String>,
-        // For the WHERE clause predicate used in the UPDATE statement. Example: "id = 4 AND
-        // content = 'hello'"
         predicate: String,
+    },
+    /// Deduped INSERT: staging ROW_NUMBER() dedup then plain INSERT (no target hash-join).
+    DedupedUpsert {
+        rows: PreparedRows,
+        identity_columns: Vec<String>,
+    },
+    /// MERGE INTO: hash-join against target for Replace/Update mutations.
+    Merge {
+        rows: PreparedRows,
+        identity_columns: Vec<String>,
+        all_columns: Vec<String>,
     },
 }
 
@@ -687,6 +694,22 @@ pub(super) fn prepare_copy_table_batch(
     table_rows: Vec<TableRow>,
 ) -> EtlResult<PreparedDuckLakeTableBatch> {
     let identity = build_copy_batch_identity(&table_name, replicated_table_schema, &table_rows)?;
+    let column_schemas: Vec<_> = replicated_table_schema.column_schemas().cloned().collect();
+    let identity_columns: Vec<String> = replicated_table_schema
+        .identity_column_schemas()
+        .map(|c| c.name.clone())
+        .collect();
+
+    let mutation = if identity_columns.is_empty() {
+        PreparedTableMutation::Upsert(prepare_rows(table_rows, &column_schemas))
+    } else {
+        // COPY is insert-only; deduped INSERT avoids target hash-join.
+        PreparedTableMutation::DedupedUpsert {
+            rows: prepare_rows(table_rows, &column_schemas),
+            identity_columns,
+        }
+    };
+
     Ok(PreparedDuckLakeTableBatch {
         table_name,
         batch_id: identity.batch_id,
@@ -696,9 +719,7 @@ pub(super) fn prepare_copy_table_batch(
         first_sequence_key: None,
         last_sequence_key: None,
         insert_column_names: replicated_column_names(replicated_table_schema),
-        action: PreparedDuckLakeTableBatchAction::Mutation(vec![PreparedTableMutation::Upsert(
-            prepare_rows(table_rows),
-        )]),
+        action: PreparedDuckLakeTableBatchAction::Mutation(vec![mutation]),
     })
 }
 
@@ -1062,41 +1083,119 @@ fn prepare_table_mutations(
     replicated_table_schema: &ReplicatedTableSchema,
     mutations: Vec<TableMutation>,
 ) -> EtlResult<Vec<PreparedTableMutation>> {
+    let column_schemas: Vec<_> = replicated_table_schema.column_schemas().cloned().collect();
+
+    let identity_columns: Vec<String> = replicated_table_schema
+        .identity_column_schemas()
+        .map(|c| c.name.clone())
+        .collect();
+
+    let all_columns: Vec<String> = replicated_table_schema
+        .column_schemas()
+        .map(|c| c.name.clone())
+        .collect();
+
+    let has_identity = !identity_columns.is_empty();
+
     let mut prepared_mutations = Vec::new();
     let mut upsert_rows = Vec::new();
+    let mut deduped_insert_rows = Vec::new();
+    let mut merge_rows = Vec::new();
     let mut delete_predicates = Vec::new();
+
+    /// Flushes accumulated rows into their respective prepared mutations.
+    macro_rules! flush_upserts {
+        ($prepared:expr, $upsert:expr, $schemas:expr) => {
+            if !$upsert.is_empty() {
+                $prepared.push(PreparedTableMutation::Upsert(prepare_rows(
+                    std::mem::take(&mut $upsert),
+                    $schemas,
+                )));
+            }
+        };
+    }
+    macro_rules! flush_deduped_inserts {
+        ($prepared:expr, $rows:expr, $schemas:expr, $id_cols:expr) => {
+            if !$rows.is_empty() {
+                $prepared.push(PreparedTableMutation::DedupedUpsert {
+                    rows: prepare_rows(std::mem::take(&mut $rows), $schemas),
+                    identity_columns: $id_cols.clone(),
+                });
+            }
+        };
+    }
+    macro_rules! flush_merge_rows {
+        ($prepared:expr, $rows:expr, $schemas:expr, $id_cols:expr, $all_cols:expr) => {
+            if !$rows.is_empty() {
+                $prepared.push(PreparedTableMutation::Merge {
+                    rows: prepare_rows(std::mem::take(&mut $rows), $schemas),
+                    identity_columns: $id_cols.clone(),
+                    all_columns: $all_cols.clone(),
+                });
+            }
+        };
+    }
+    macro_rules! flush_deletes {
+        ($prepared:expr, $preds:expr) => {
+            if !$preds.is_empty() {
+                $prepared.push(PreparedTableMutation::Delete {
+                    predicates: std::mem::take(&mut $preds),
+                    origin: "delete",
+                });
+            }
+        };
+    }
 
     for mutation in mutations {
         match mutation {
             TableMutation::Insert(row) => {
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
+                flush_deletes!(prepared_mutations, delete_predicates);
+                flush_merge_rows!(
+                    prepared_mutations,
+                    merge_rows,
+                    &column_schemas,
+                    identity_columns,
+                    all_columns
+                );
+                if has_identity {
+                    deduped_insert_rows.push(row);
+                } else {
+                    upsert_rows.push(row);
                 }
-                upsert_rows.push(row);
             }
             TableMutation::Delete(row) => {
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
+                flush_upserts!(prepared_mutations, upsert_rows, &column_schemas);
+                flush_deduped_inserts!(
+                    prepared_mutations,
+                    deduped_insert_rows,
+                    &column_schemas,
+                    identity_columns
+                );
+                flush_merge_rows!(
+                    prepared_mutations,
+                    merge_rows,
+                    &column_schemas,
+                    identity_columns,
+                    all_columns
+                );
                 delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
             }
             TableMutation::Update { delete_row, new_row } => {
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
-                }
+                flush_upserts!(prepared_mutations, upsert_rows, &column_schemas);
+                flush_deduped_inserts!(
+                    prepared_mutations,
+                    deduped_insert_rows,
+                    &column_schemas,
+                    identity_columns
+                );
+                flush_merge_rows!(
+                    prepared_mutations,
+                    merge_rows,
+                    &column_schemas,
+                    identity_columns,
+                    all_columns
+                );
+                flush_deletes!(prepared_mutations, delete_predicates);
                 match new_row {
                     UpdatedTableRow::Full(upsert_row) => {
                         prepared_mutations.push(PreparedTableMutation::Delete {
@@ -1106,8 +1205,10 @@ fn prepare_table_mutations(
                             )?],
                             origin: "update",
                         });
-                        prepared_mutations
-                            .push(PreparedTableMutation::Upsert(prepare_rows(vec![upsert_row])));
+                        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
+                            vec![upsert_row],
+                            &column_schemas,
+                        )));
                     }
                     UpdatedTableRow::Partial(partial_row) => {
                         prepared_mutations.push(PreparedTableMutation::Update {
@@ -1124,36 +1225,34 @@ fn prepare_table_mutations(
                 }
             }
             TableMutation::Replace(row) => {
-                if !upsert_rows.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(
-                        std::mem::take(&mut upsert_rows),
-                    )));
-                }
-                if !delete_predicates.is_empty() {
-                    prepared_mutations.push(PreparedTableMutation::Delete {
-                        predicates: std::mem::take(&mut delete_predicates),
-                        origin: "delete",
-                    });
-                }
-
-                prepared_mutations.push(PreparedTableMutation::Delete {
-                    predicates: vec![delete_predicate_from_row(replicated_table_schema, &row)?],
-                    origin: "replace",
-                });
-                prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(vec![row])));
+                flush_upserts!(prepared_mutations, upsert_rows, &column_schemas);
+                flush_deduped_inserts!(
+                    prepared_mutations,
+                    deduped_insert_rows,
+                    &column_schemas,
+                    identity_columns
+                );
+                flush_deletes!(prepared_mutations, delete_predicates);
+                merge_rows.push(row);
             }
         }
     }
 
-    if !upsert_rows.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Upsert(prepare_rows(upsert_rows)));
-    }
-    if !delete_predicates.is_empty() {
-        prepared_mutations.push(PreparedTableMutation::Delete {
-            predicates: delete_predicates,
-            origin: "delete",
-        });
-    }
+    flush_upserts!(prepared_mutations, upsert_rows, &column_schemas);
+    flush_deduped_inserts!(
+        prepared_mutations,
+        deduped_insert_rows,
+        &column_schemas,
+        identity_columns
+    );
+    flush_merge_rows!(
+        prepared_mutations,
+        merge_rows,
+        &column_schemas,
+        identity_columns,
+        all_columns
+    );
+    flush_deletes!(prepared_mutations, delete_predicates);
 
     Ok(prepared_mutations)
 }
@@ -1920,6 +2019,24 @@ fn apply_table_mutation(
             assignments.as_slice(),
             predicate,
         ),
+        PreparedTableMutation::DedupedUpsert { rows, identity_columns } => {
+            histogram!(
+                ETL_DUCKLAKE_UPSERT_ROWS,
+                BATCH_KIND_LABEL => batch.batch_kind.as_str(),
+                PREPARED_ROWS_KIND_LABEL => prepared_rows_kind(rows),
+            )
+            .record(prepared_rows_count(rows) as f64);
+            apply_deduped_upsert(conn, rows, reusable_staging_table, identity_columns)
+        }
+        PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
+            histogram!(
+                ETL_DUCKLAKE_UPSERT_ROWS,
+                BATCH_KIND_LABEL => batch.batch_kind.as_str(),
+                PREPARED_ROWS_KIND_LABEL => prepared_rows_kind(rows),
+            )
+            .record(prepared_rows_count(rows) as f64);
+            apply_merge_mutation(conn, rows, reusable_staging_table, identity_columns, all_columns)
+        }
     }
 }
 
@@ -1939,6 +2056,148 @@ fn apply_upsert_mutation(
     }
 
     reusable_staging_table.stage_and_insert(conn, prepared_rows)
+}
+
+/// Deduplicates staging table then plain INSERT (no hash-join against target).
+fn apply_deduped_upsert(
+    conn: &duckdb::Connection,
+    prepared_rows: &PreparedRows,
+    reusable_staging_table: &mut ReusableStagingTable,
+    identity_columns: &[String],
+) -> EtlResult<()> {
+    let row_count = match prepared_rows {
+        PreparedRows::Appender(values) => values.len(),
+        PreparedRows::SqlLiterals(values) => values.len(),
+    };
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    reusable_staging_table.prepare(conn)?;
+    reusable_staging_table.load_rows(conn, prepared_rows)?;
+
+    let target = qualified_lake_table_name(&reusable_staging_table.table_name);
+    let staging = quote_identifier(&reusable_staging_table.staging_name);
+
+    let identity_join = identity_columns
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let cols = quoted_column_list(&reusable_staging_table.insert_column_names);
+
+    let sql = format!(
+        "INSERT INTO {target} ({cols}) \
+         SELECT {cols} FROM {staging} \
+         QUALIFY ROW_NUMBER() OVER (PARTITION BY {identity_join} \
+         ORDER BY rowid DESC) = 1"
+    );
+
+    conn.execute_batch(&sql).map_err(|err| {
+        tracing::error!(error = %err, "error deduped INSERT");
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake deduped INSERT failed",
+            format_query_error_detail(&sql),
+            source: err
+        )
+    })?;
+    Ok(())
+}
+
+/// Deduplicates staging table then MERGE INTO target for Replace/Update mutations.
+fn apply_merge_mutation(
+    conn: &duckdb::Connection,
+    prepared_rows: &PreparedRows,
+    reusable_staging_table: &mut ReusableStagingTable,
+    identity_columns: &[String],
+    all_columns: &[String],
+) -> EtlResult<()> {
+    let row_count = match prepared_rows {
+        PreparedRows::Appender(values) => values.len(),
+        PreparedRows::SqlLiterals(values) => values.len(),
+    };
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    reusable_staging_table.prepare(conn)?;
+    reusable_staging_table.load_rows(conn, prepared_rows)?;
+
+    let target = qualified_lake_table_name(&reusable_staging_table.table_name);
+    let staging = quote_identifier(&reusable_staging_table.staging_name);
+
+    let identity_join = identity_columns
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let deduped_source = format!(
+        "(SELECT * FROM {staging} \
+         QUALIFY ROW_NUMBER() OVER (PARTITION BY {identity_join} \
+         ORDER BY rowid DESC) = 1)"
+    );
+
+    let on_clause = identity_columns
+        .iter()
+        .map(|c| {
+            let q = quote_identifier(c);
+            format!("target.{q} = source.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let update_set = all_columns
+        .iter()
+        .filter(|c| !identity_columns.contains(c))
+        .map(|c| {
+            let q = quote_identifier(c);
+            format!("{q} = source.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let insert_cols = all_columns
+        .iter()
+        .map(|c| quote_identifier(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_vals = all_columns
+        .iter()
+        .map(|c| format!("source.{}", quote_identifier(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = if update_set.is_empty() {
+        // All columns are identity columns; no SET clause needed.
+        format!(
+            "MERGE INTO {target} AS target \
+             USING {deduped_source} AS source \
+             ON ({on_clause}) \
+             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+        )
+    } else {
+        format!(
+            "MERGE INTO {target} AS target \
+             USING {deduped_source} AS source \
+             ON ({on_clause}) \
+             WHEN MATCHED THEN UPDATE SET {update_set} \
+             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+        )
+    };
+
+    conn.execute_batch(&sql).map_err(|err| {
+        tracing::error!(error = %err, "error MERGE INTO");
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake MERGE INTO failed",
+            format_query_error_detail(&sql),
+            source: err
+        )
+    })?;
+    Ok(())
 }
 
 /// Applies one delete batch inside an open DuckLake transaction.
@@ -2067,6 +2326,12 @@ fn apply_sub_batch_rows(batch: &PreparedDuckLakeTableBatch) -> Option<usize> {
             PreparedRows::Appender(values) => values.len(),
             PreparedRows::SqlLiterals(values) => values.len(),
         }),
+        PreparedTableMutation::DedupedUpsert { rows, .. } | PreparedTableMutation::Merge { rows, .. } => {
+            Some(match rows {
+                PreparedRows::Appender(values) => values.len(),
+                PreparedRows::SqlLiterals(values) => values.len(),
+            })
+        }
         PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => None,
     }
 }
@@ -2386,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_table_mutations_replace_emits_delete_then_upsert() {
+    fn prepare_table_mutations_replace_emits_merge() {
         let replicated_table_schema = make_replicated_schema();
         let row = TableRow::new(vec![Cell::I32(1), Cell::String("alice".to_owned())]);
 
@@ -2394,26 +2659,17 @@ mod tests {
             prepare_table_mutations(&replicated_table_schema, vec![TableMutation::Replace(row)])
                 .unwrap();
 
-        assert_eq!(prepared.len(), 2);
+        assert_eq!(prepared.len(), 1);
         match &prepared[0] {
-            PreparedTableMutation::Delete { predicates, origin } => {
-                assert_eq!(predicates, &vec!["\"id\" = 1".to_owned()]);
-                assert_eq!(origin, &"replace");
+            PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
+                assert_eq!(identity_columns, &vec!["id".to_owned()]);
+                assert_eq!(all_columns.len(), 2);
+                match rows {
+                    PreparedRows::Appender(rows) => assert_eq!(rows.len(), 1),
+                    PreparedRows::SqlLiterals(rows) => assert_eq!(rows.len(), 1),
+                }
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                panic!("expected delete first")
-            }
-        }
-        match &prepared[1] {
-            PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
-                assert_eq!(rows.len(), 1);
-            }
-            PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) => {
-                panic!("expected appender payload")
-            }
-            PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
-                panic!("expected upsert second")
-            }
+            _ => panic!("expected merge"),
         }
     }
 
@@ -2442,9 +2698,7 @@ mod tests {
                 );
                 assert_eq!(predicate, "\"id\" = 1");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
-                panic!("expected update")
-            }
+            _ => panic!("expected update"),
         }
     }
 
@@ -2498,9 +2752,7 @@ mod tests {
                 );
                 assert_eq!(predicate, "\"email\" = 'alice@example.com'");
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
-                panic!("expected update")
-            }
+            _ => panic!("expected update"),
         }
     }
 
@@ -2561,9 +2813,7 @@ mod tests {
                      \"payload\" = 'toast'"
                 );
             }
-            PreparedTableMutation::Upsert(_) | PreparedTableMutation::Delete { .. } => {
-                panic!("expected update")
-            }
+            _ => panic!("expected update"),
         }
     }
 
@@ -2602,15 +2852,10 @@ mod tests {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(rows)) => {
+                    PreparedTableMutation::DedupedUpsert { rows: PreparedRows::Appender(rows), .. } => {
                         assert_eq!(rows.len(), 2);
                     }
-                    PreparedTableMutation::Upsert(PreparedRows::SqlLiterals(_)) => {
-                        panic!("expected appender payload")
-                    }
-                    PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => {
-                        panic!("expected upsert")
-                    }
+                    _ => panic!("expected deduped upsert appender"),
                 }
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
@@ -2662,12 +2907,12 @@ mod tests {
                 assert_eq!(prepared.len(), 3);
                 assert!(matches!(
                     prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::DedupedUpsert { .. }
                 ));
                 assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
                     prepared[2],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::DedupedUpsert { .. }
                 ));
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
@@ -2715,9 +2960,7 @@ mod tests {
                             &vec!["\"id\" = 1".to_owned(), "\"id\" = 2".to_owned()]
                         );
                     }
-                    PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                        panic!("expected delete batch")
-                    }
+                    _ => panic!("expected delete batch"),
                 }
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
@@ -2814,9 +3057,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                    panic!("expected delete batch")
-                }
+                _ => panic!("expected delete batch"),
             },
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
         }
@@ -2826,9 +3067,7 @@ mod tests {
                 PreparedTableMutation::Delete { predicates, .. } => {
                     assert_eq!(predicates.len(), 1);
                 }
-                PreparedTableMutation::Upsert(_) | PreparedTableMutation::Update { .. } => {
-                    panic!("expected delete batch")
-                }
+                _ => panic!("expected delete batch"),
             },
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
         }
@@ -2885,7 +3124,7 @@ mod tests {
                 assert_eq!(prepared.len(), 4);
                 assert!(matches!(
                     prepared[0],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::DedupedUpsert { .. }
                 ));
                 assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
                 assert!(matches!(
@@ -2894,7 +3133,7 @@ mod tests {
                 ));
                 assert!(matches!(
                     prepared[3],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
+                    PreparedTableMutation::DedupedUpsert { .. }
                 ));
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),

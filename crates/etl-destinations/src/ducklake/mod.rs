@@ -26,6 +26,7 @@ pub use core::{
     DuckLakeDestination, DuckLakeExternalMaintenanceConfig, DuckLakeExternalMaintenancePause,
     DuckLakeMaintenanceMode, table_name_to_ducklake_table_name,
 };
+pub use schema::{SortDirection, SortKey, TableStorageConfig};
 #[cfg(feature = "test-utils")]
 pub use core::{
     arm_pause_next_streaming_write_for_tests, release_paused_streaming_write_for_tests,

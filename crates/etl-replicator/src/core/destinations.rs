@@ -174,6 +174,8 @@ mod clickhouse {
 /// DuckLake destination startup.
 #[cfg(feature = "ducklake")]
 mod ducklake {
+    use std::collections::HashMap;
+
     use etl::pipeline::Pipeline;
     use etl_config::{
         parse_ducklake_s3_data_path, parse_ducklake_url,
@@ -252,6 +254,7 @@ mod ducklake {
             expire_snapshots_older_than.clone(),
             external_maintenance,
             store.clone(),
+            HashMap::new(),
         )
         .await?;
 

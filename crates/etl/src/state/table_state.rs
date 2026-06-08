@@ -81,6 +81,9 @@ pub enum TableState {
         solution: Option<String>,
         /// Retry policy specifying how/when to retry.
         retry_policy: TableRetryPolicy,
+        /// LSN at which the error occurred, used for slot ack hold-back.
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "optional_lsn_serde")]
+        errored_at_lsn: Option<PgLsn>,
         /// Original error that triggered the table error state.
         ///
         /// This field is **not persisted** — it is skipped during
@@ -107,6 +110,14 @@ impl TableState {
     /// Returns whether this state represents an errored state.
     pub fn is_errored(&self) -> bool {
         matches!(self, Self::Errored { .. })
+    }
+
+    /// Returns the `errored_at_lsn` if this is an `Errored` state.
+    pub fn errored_at_lsn(&self) -> Option<PgLsn> {
+        match self {
+            Self::Errored { errored_at_lsn, .. } => *errored_at_lsn,
+            _ => None,
+        }
     }
 
     /// Converts this state to the database storage format.
@@ -180,6 +191,7 @@ impl From<TableError> for TableState {
             reason: value.reason,
             solution: value.solution,
             retry_policy: value.retry_policy,
+            errored_at_lsn: value.errored_at_lsn,
             source_err: value.source_err,
         }
     }
@@ -297,6 +309,30 @@ impl fmt::Display for TableStateType {
     }
 }
 
+/// Serde helpers for `Option<PgLsn>`.
+mod optional_lsn_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tokio_postgres::types::PgLsn;
+
+    pub(super) fn serialize<S>(lsn: &Option<PgLsn>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        lsn.map(|l| l.to_string()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<PgLsn>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s: Option<String> = Option::deserialize(deserializer)?;
+        match s {
+            Some(s) => s.parse().map(Some).map_err(|e| serde::de::Error::custom(format!("{e:?}"))),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Serde serialization helpers for Postgres LSN values.
 mod lsn_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -352,6 +388,7 @@ mod tests {
             reason: "Test error".to_owned(),
             solution: Some("Test solution".to_owned()),
             retry_policy: TableRetryPolicy::NoRetry,
+            errored_at_lsn: None,
             source_err: etl_error!(ErrorKind::Unknown, "Test"),
         };
         let json = serde_json::to_value(&errored).unwrap();
@@ -440,6 +477,7 @@ mod tests {
                 reason: "broken".to_owned(),
                 solution: Some("fix it".to_owned()),
                 retry_policy: TableRetryPolicy::ManualRetry,
+                errored_at_lsn: None,
                 source_err: etl_error!(ErrorKind::Unknown, "Test"),
             },
         ];

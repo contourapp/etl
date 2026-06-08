@@ -159,6 +159,8 @@ pub struct DuckLakeDestination<S> {
     applied_batches_table_created: Arc<AtomicBool>,
     /// Cache tracking whether the ETL streaming progress table already exists.
     streaming_progress_table_created: Arc<AtomicBool>,
+    /// Per-table sort keys and partition expressions applied after CREATE TABLE.
+    table_storage_config: Arc<HashMap<String, crate::ducklake::schema::TableStorageConfig>>,
 }
 
 /// Held by an external DuckLake maintenance coordinator while foreground
@@ -887,6 +889,7 @@ where
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
         store: S,
+        tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
     ) -> EtlResult<Self> {
         Self::new_with_external_maintenance(
             catalog_url,
@@ -898,6 +901,7 @@ where
             expire_snapshots_older_than,
             DuckLakeExternalMaintenanceConfig::default(),
             store,
+            tables,
         )
         .await
     }
@@ -915,6 +919,7 @@ where
         expire_snapshots_older_than: Option<String>,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
         store: S,
+        tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
     ) -> EtlResult<Self> {
         register_metrics();
 
@@ -1052,6 +1057,7 @@ where
             created_tables: Arc::clone(&created_tables),
             applied_batches_table_created: Arc::default(),
             streaming_progress_table_created: Arc::default(),
+            table_storage_config: Arc::new(tables),
         };
         gauge!(ETL_DUCKLAKE_POOL_SIZE).set(pool_size as f64);
         let shutdown_signal_manager = Arc::clone(&manager);
@@ -2006,6 +2012,7 @@ where
         let ddl = build_create_table_sql_ducklake(table_name, &column_schemas);
         let created_tables = Arc::clone(&self.created_tables);
         let table_name = table_name.to_owned();
+        let storage_config = self.table_storage_config.get(&table_name).cloned();
         let _checkpoint_guard = self.acquire_mutation_guard().await;
 
         run_duckdb_blocking(
@@ -2027,6 +2034,21 @@ where
                             format_query_error_detail(&ddl),
                             source: error
                         ));
+                    }
+                }
+                // Apply sort keys and partition expressions after CREATE.
+                if let Some(config) = &storage_config {
+                    let stmts =
+                        crate::ducklake::schema::build_alter_table_storage_sql(&table_name, config);
+                    for stmt in &stmts {
+                        conn.execute_batch(stmt).map_err(|error| {
+                            etl_error!(
+                                ErrorKind::DestinationQueryFailed,
+                                "DuckLake ALTER TABLE storage config failed",
+                                format_query_error_detail(stmt),
+                                source: error
+                            )
+                        })?;
                     }
                 }
                 debug!(table = %table_name, "ducklake create table finished");
@@ -2601,6 +2623,7 @@ pub fn table_name_to_ducklake_table_name(table_name: &TableName) -> EtlResult<Du
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         env,
         path::{Path, PathBuf},
         time::Instant,
@@ -3273,6 +3296,7 @@ mod tests {
                 None,
                 None,
                 store,
+                HashMap::new(),
             )
             .await
             .expect("failed to create destination");
@@ -3338,6 +3362,7 @@ mod tests {
                 None,
                 None,
                 store,
+                HashMap::new(),
             )
             .await
             .expect("failed to create destination");
@@ -3400,6 +3425,7 @@ mod tests {
                 None,
                 None,
                 store,
+                HashMap::new(),
             )
             .await
             .expect("failed to create destination");

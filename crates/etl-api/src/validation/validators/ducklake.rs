@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use etl::store::both::memory::MemoryStore;
 use etl_config::{parse_ducklake_s3_data_path, parse_ducklake_url};
@@ -119,6 +121,7 @@ impl Validator for DucklakeValidator {
             self.maintenance_target_file_size.clone(),
             self.expire_snapshots_older_than.clone(),
             MemoryStore::new(),
+            HashMap::new(),
         )
         .await
         {

@@ -28,7 +28,7 @@ Usage:
 
 */
 
-use std::{error::Error, sync::Once};
+use std::{collections::HashMap, error::Error, sync::Once};
 
 use clap::{Args, Parser};
 use etl::{
@@ -230,6 +230,7 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         None,
         None,
         store.clone(),
+        HashMap::new(),
     )
     .await?;
 
