@@ -413,7 +413,9 @@ fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
         .iter()
         .map(|elem| {
             let unquoted = elem.trim_matches('"');
-            range_text_to_struct_literal(unquoted, bound_type)
+            // Postgres escapes quotes inside quoted array elements as \"
+            let unescaped = unquoted.replace("\\\"", "\"");
+            range_text_to_struct_literal(&unescaped, bound_type)
         })
         .collect();
 
@@ -603,6 +605,157 @@ mod tests {
                 assert_eq!(rows, vec!["(1, [1, NULL, 3])"]);
             }
             PreparedRows::Appender(_) => panic!("expected sql literal fallback"),
+        }
+    }
+
+    // --- Range conversion tests ---
+
+    #[test]
+    fn split_range_bounds_unquoted() {
+        assert_eq!(
+            split_range_bounds("1,10"),
+            Some(("1".to_owned(), "10".to_owned()))
+        );
+    }
+
+    #[test]
+    fn split_range_bounds_quoted_timestamps() {
+        assert_eq!(
+            split_range_bounds(r#""2026-01-28 01:17:00+00","2026-01-28 05:25:00+00""#),
+            Some((
+                "2026-01-28 01:17:00+00".to_owned(),
+                "2026-01-28 05:25:00+00".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn split_range_bounds_unbounded_upper() {
+        assert_eq!(
+            split_range_bounds("1,"),
+            Some(("1".to_owned(), String::new()))
+        );
+    }
+
+    #[test]
+    fn split_range_bounds_unbounded_lower() {
+        assert_eq!(
+            split_range_bounds(",10"),
+            Some((String::new(), "10".to_owned()))
+        );
+    }
+
+    #[test]
+    fn range_text_to_struct_literal_unquoted_integers() {
+        assert_eq!(
+            range_text_to_struct_literal("[1,10)", "INTEGER"),
+            "{'lower': CAST('1' AS INTEGER), 'upper': CAST('10' AS INTEGER)}"
+        );
+    }
+
+    #[test]
+    fn range_text_to_struct_literal_quoted_timestamps() {
+        assert_eq!(
+            range_text_to_struct_literal(
+                r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#,
+                "TIMESTAMPTZ"
+            ),
+            "{'lower': CAST('2026-01-28 01:17:00+00' AS TIMESTAMPTZ), 'upper': CAST('2026-01-28 05:25:00+00' AS TIMESTAMPTZ)}"
+        );
+    }
+
+    #[test]
+    fn range_text_to_struct_literal_empty() {
+        assert_eq!(range_text_to_struct_literal("empty", "INTEGER"), "NULL");
+    }
+
+    #[test]
+    fn range_text_to_struct_literal_unbounded_upper() {
+        assert_eq!(
+            range_text_to_struct_literal("[1,)", "INTEGER"),
+            "{'lower': CAST('1' AS INTEGER), 'upper': NULL}"
+        );
+    }
+
+    #[test]
+    fn range_array_text_to_list_literal_pg_format() {
+        // Postgres array text: {"[1,2)","[3,4)"}
+        assert_eq!(
+            range_array_text_to_list_literal(r#"{"[1,2)","[3,4)"}"#, "INTEGER"),
+            "[{'lower': CAST('1' AS INTEGER), 'upper': CAST('2' AS INTEGER)}, {'lower': CAST('3' AS INTEGER), 'upper': CAST('4' AS INTEGER)}]"
+        );
+    }
+
+    #[test]
+    fn range_array_text_to_list_literal_pg_quoted_timestamps() {
+        // Postgres array text with quoted range bounds containing spaces:
+        // {"[\"2026-01-28 01:17:00+00\",\"2026-01-28 05:25:00+00\")"}
+        let pg_text = r#"{"[\"2026-01-28 01:17:00+00\",\"2026-01-28 05:25:00+00\")"}"#;
+        let result = range_array_text_to_list_literal(pg_text, "TIMESTAMPTZ");
+        assert_eq!(
+            result,
+            "[{'lower': CAST('2026-01-28 01:17:00+00' AS TIMESTAMPTZ), 'upper': CAST('2026-01-28 05:25:00+00' AS TIMESTAMPTZ)}]"
+        );
+    }
+
+    #[test]
+    fn range_array_text_to_list_literal_empty() {
+        assert_eq!(range_array_text_to_list_literal("{}", "INTEGER"), "[]");
+    }
+
+    #[test]
+    fn cell_to_sql_literal_typed_scalar_range() {
+        let cell = Cell::String("[1,10)".to_owned());
+        assert_eq!(
+            cell_to_sql_literal_typed(&cell, &Type::INT4_RANGE),
+            "{'lower': CAST('1' AS integer), 'upper': CAST('10' AS integer)}"
+        );
+    }
+
+    #[test]
+    fn cell_to_sql_literal_typed_range_array_as_array_cell_string() {
+        // CDC delivers tstzrange[] as ArrayCell::String
+        let cell = Cell::Array(ArrayCell::String(vec![
+            Some(r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#.to_owned()),
+            None,
+        ]));
+        let result = cell_to_sql_literal_typed(&cell, &Type::TSTZ_RANGE_ARRAY);
+        assert_eq!(
+            result,
+            "[{'lower': CAST('2026-01-28 01:17:00+00' AS timestamptz), 'upper': CAST('2026-01-28 05:25:00+00' AS timestamptz)}, NULL]"
+        );
+    }
+
+    #[test]
+    fn cell_to_sql_literal_typed_range_array_empty() {
+        let cell = Cell::Array(ArrayCell::String(vec![]));
+        let result = cell_to_sql_literal_typed(&cell, &Type::TSTZ_RANGE_ARRAY);
+        assert_eq!(result, "[]");
+    }
+
+    #[test]
+    fn prepare_rows_range_array_forces_sql_literals() {
+        let schemas = vec![
+            ColumnSchema::new("id".to_owned(), Type::INT4, -1, 1, Some(1), false),
+            ColumnSchema::new("r".to_owned(), Type::TSTZ_RANGE_ARRAY, -1, 2, None, true),
+        ];
+        let prepared = prepare_rows(
+            vec![TableRow::new(vec![
+                Cell::I32(1),
+                Cell::Array(ArrayCell::String(vec![Some(
+                    r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#.to_owned(),
+                )])),
+            ])],
+            &schemas,
+        );
+        match prepared {
+            PreparedRows::SqlLiterals(rows) => {
+                assert_eq!(
+                    rows,
+                    vec!["(1, [{'lower': CAST('2026-01-28 01:17:00+00' AS timestamptz), 'upper': CAST('2026-01-28 05:25:00+00' AS timestamptz)}])"]
+                );
+            }
+            PreparedRows::Appender(_) => panic!("expected sql literal path for range arrays"),
         }
     }
 }

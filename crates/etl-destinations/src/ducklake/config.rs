@@ -1211,6 +1211,7 @@ mod tests {
             &data_url,
             Some(&s3),
             Some("ducklake"),
+            None,
             DuckDbExtensionStrategy::VendoredLocal { platform_dir: "linux_arm64" },
             Some(&extension_dir),
         )
