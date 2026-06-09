@@ -1008,6 +1008,8 @@ impl r2d2::ManageConnection for DuckLakeConnectionManager {
 struct DuckDbMaintenanceExecutor {
     pool: Arc<r2d2::Pool<DuckLakeConnectionManager>>,
     blocking_slots: Arc<Semaphore>,
+    query_timeout: Duration,
+    abort_on_timeout: bool,
 }
 
 impl DuckDbMaintenanceExecutor {
@@ -1016,7 +1018,7 @@ impl DuckDbMaintenanceExecutor {
         R: Send + 'static,
         F: FnOnce(&duckdb::Connection) -> EtlResult<R> + Send + 'static,
     {
-        self.run_with_timeout(MAINTENANCE_QUERY_TIMEOUT, operation).await
+        self.run_with_timeout(self.query_timeout, operation).await
     }
 
     async fn run_with_timeout<R, F>(&self, timeout: Duration, operation: F) -> EtlResult<R>
@@ -1291,11 +1293,27 @@ impl DuckDbMaintenanceExecutor {
             DUCKDB_MAINTENANCE_OPERATION_KIND,
             remaining_ms_until(abort_deadline)
         );
+        let abort_on_timeout = self.abort_on_timeout;
         let blocking_result = tokio::select! {
             biased;
             result = blocking_task => result,
             _ = tokio::time::sleep_until(abort_deadline) => {
-                abort_stuck_duckdb_maintenance_operation(timeout, BLOCKING_ABORT_GRACE);
+                if abort_on_timeout {
+                    abort_stuck_duckdb_maintenance_operation(timeout, BLOCKING_ABORT_GRACE);
+                } else {
+                    tracing::error!(
+                        operation_kind = DUCKDB_MAINTENANCE_OPERATION_KIND,
+                        timeout_ms = timeout.as_millis() as u64,
+                        abort_grace_ms = BLOCKING_ABORT_GRACE.as_millis() as u64,
+                        "ducklake maintenance blocking operation did not return after interrupt \
+                         grace; returning error (abort_on_timeout=false): operation_kind={}, \
+                         timeout_ms={}, abort_grace_ms={}",
+                        DUCKDB_MAINTENANCE_OPERATION_KIND,
+                        timeout.as_millis(),
+                        BLOCKING_ABORT_GRACE.as_millis()
+                    );
+                    return Err(duckdb_maintenance_timeout_error(timeout, "abort_grace_exceeded"));
+                }
             }
         };
 
@@ -1442,6 +1460,14 @@ pub struct DuckLakeMaintenanceConfig {
     pub metadata_schema: Option<String>,
     /// DuckLake `target_file_size` used by compaction.
     pub maintenance_target_file_size: Option<String>,
+    /// Per-query timeout for DuckDB maintenance operations. Defaults to
+    /// `MAINTENANCE_QUERY_TIMEOUT` (6 minutes) when `None`.
+    pub query_timeout: Option<Duration>,
+    /// When `true` (the default), the runner calls `process::abort()` if a
+    /// DuckDB operation does not return within the interrupt grace period after
+    /// a timeout. Set to `false` to return an error instead, which is safer
+    /// when maintenance runs in-process alongside the main pipeline.
+    pub abort_on_timeout: bool,
     /// Inline flush operation config.
     pub inline_flush: InlineFlushMaintenanceConfig,
     /// Merge-adjacent-files operation config.
@@ -1721,7 +1747,13 @@ async fn open_maintenance_executor(
     };
     let pool = Arc::new(build_warm_ducklake_pool(manager, config.pool_size).await?);
     let blocking_slots = Arc::new(Semaphore::new(config.pool_size as usize));
-    let executor = DuckDbMaintenanceExecutor { pool, blocking_slots };
+    let query_timeout = config.query_timeout.unwrap_or(MAINTENANCE_QUERY_TIMEOUT);
+    let executor = DuckDbMaintenanceExecutor {
+        pool,
+        blocking_slots,
+        query_timeout,
+        abort_on_timeout: config.abort_on_timeout,
+    };
     let sql = maintenance_target_file_size_sql(Some(target_file_size));
     executor
         .run(move |conn| {
@@ -2566,6 +2598,8 @@ mod tests {
         DuckDbMaintenanceExecutor {
             pool: Arc::new(pool),
             blocking_slots: Arc::new(Semaphore::new(1)),
+            query_timeout: MAINTENANCE_QUERY_TIMEOUT,
+            abort_on_timeout: true,
         }
     }
 

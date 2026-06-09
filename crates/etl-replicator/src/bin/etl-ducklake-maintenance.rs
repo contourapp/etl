@@ -84,6 +84,8 @@ async fn run(config: ReplicatorConfig) -> MaintenanceResult<()> {
         s3,
         metadata_schema,
         maintenance_target_file_size,
+        query_timeout: None,
+        abort_on_timeout: true,
         inline_flush: InlineFlushMaintenanceConfig {
             enabled: env_bool("ETL_DUCKLAKE_MAINTENANCE__INLINE_FLUSH__ENABLED", true),
             min_inlined_bytes: env_u64(
