@@ -253,6 +253,7 @@ mod ducklake {
             None, // duckdb_memory_limit: managed by upstream infrastructure
             maintenance_target_file_size.clone(),
             expire_snapshots_older_than.clone(),
+            true, // abort_on_timeout: standalone replicator process
             external_maintenance,
             store.clone(),
             HashMap::new(),

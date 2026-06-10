@@ -56,7 +56,7 @@ use crate::{
         },
         client::{
             DuckLakeConnectionManager, DuckLakeInterruptRegistry, build_warm_ducklake_pool,
-            format_query_error_detail, run_duckdb_blocking,
+            format_query_error_detail, run_duckdb_blocking, set_abort_on_blocking_timeout,
         },
         config::{
             MAINTENANCE_TARGET_FILE_SIZE, MIN_EXPIRE_SNAPSHOTS_OLDER_THAN,
@@ -901,6 +901,7 @@ where
             None,
             maintenance_target_file_size,
             expire_snapshots_older_than,
+            true, // abort_on_timeout: default for standalone processes
             DuckLakeExternalMaintenanceConfig::default(),
             store,
             tables,
@@ -919,6 +920,7 @@ where
         duckdb_memory_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
+        abort_on_timeout: bool,
         store: S,
         tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
     ) -> EtlResult<Self> {
@@ -931,6 +933,7 @@ where
             duckdb_memory_limit,
             maintenance_target_file_size,
             expire_snapshots_older_than,
+            abort_on_timeout,
             DuckLakeExternalMaintenanceConfig::default(),
             store,
             tables,
@@ -950,11 +953,13 @@ where
         duckdb_memory_limit: Option<String>,
         maintenance_target_file_size: Option<String>,
         expire_snapshots_older_than: Option<String>,
+        abort_on_timeout: bool,
         external_maintenance: DuckLakeExternalMaintenanceConfig,
         store: S,
         tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
     ) -> EtlResult<Self> {
         register_metrics();
+        set_abort_on_blocking_timeout(abort_on_timeout);
 
         if !matches!(catalog_url.scheme(), "postgres" | "postgresql") {
             return Err(etl_error!(

@@ -36,6 +36,11 @@ use crate::ducklake::{
 static NEXT_CONNECTION_INIT_ID: AtomicU64 = AtomicU64::new(1);
 /// Monotonic identifier assigned to each timed DuckDB blocking operation.
 static NEXT_DUCKDB_BLOCKING_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+/// Controls whether a stuck blocking operation triggers `process::abort()`.
+/// When `false`, a recoverable error is returned instead. Defaults to `true`
+/// for standalone replicator processes; embedders (e.g. contour-core) set this
+/// to `false` so a stuck DuckDB query does not kill the host process.
+static ABORT_ON_BLOCKING_TIMEOUT: AtomicBool = AtomicBool::new(true);
 /// Matches one libpq password field inside a conninfo string.
 static POSTGRES_PASSWORD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"password=(?:'([^'\\]|\\.)*'|[^\s,);]+)")
@@ -53,6 +58,15 @@ const DUCKDB_BLOCKING_OPERATION_KIND: &str = "foreground";
 const BLOCKING_ABORT_GRACE: Duration = Duration::from_secs(30);
 /// Description used when DuckLake rejects new blocking work during shutdown.
 const DUCKLAKE_SHUTDOWN_REQUESTED: &str = "DuckLake shutdown requested";
+
+/// Sets whether a stuck blocking operation should abort the process.
+///
+/// Call with `false` when the DuckLake destination is embedded in a host
+/// process (e.g. contour-core) that must stay alive even when a single DuckDB
+/// query gets stuck.
+pub(super) fn set_abort_on_blocking_timeout(abort: bool) {
+    ABORT_ON_BLOCKING_TIMEOUT.store(abort, Ordering::Relaxed);
+}
 
 /// Reason recorded for the first interrupt sent to a DuckLake connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1241,7 +1255,33 @@ where
             // the stuck native call also keeps holding its semaphore permit and
             // blocking thread, so restarting the process is the recoverable
             // boundary.
-            abort_stuck_duckdb_blocking_operation(operation_id, timeout, BLOCKING_ABORT_GRACE);
+            if ABORT_ON_BLOCKING_TIMEOUT.load(Ordering::Relaxed) {
+                abort_stuck_duckdb_blocking_operation(operation_id, timeout, BLOCKING_ABORT_GRACE);
+            } else {
+                tracing::error!(
+                    operation_id,
+                    operation_kind = DUCKDB_BLOCKING_OPERATION_KIND,
+                    timeout_ms = timeout.as_millis() as u64,
+                    abort_grace_ms = BLOCKING_ABORT_GRACE.as_millis() as u64,
+                    "ducklake blocking operation did not return after timeout interrupt; \
+                     returning error (abort disabled): operation_id={}, operation_kind={}, \
+                     timeout_ms={}, abort_grace_ms={}",
+                    operation_id,
+                    DUCKDB_BLOCKING_OPERATION_KIND,
+                    timeout.as_millis(),
+                    BLOCKING_ABORT_GRACE.as_millis()
+                );
+                return Err(etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake blocking operation stuck after timeout interrupt",
+                    format!(
+                        "operation_id={}, timeout_ms={}, abort_grace_ms={}",
+                        operation_id,
+                        timeout.as_millis(),
+                        BLOCKING_ABORT_GRACE.as_millis()
+                    )
+                ));
+            }
         }
     };
 
