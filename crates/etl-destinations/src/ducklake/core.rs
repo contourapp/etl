@@ -115,6 +115,14 @@ pub(super) fn is_create_table_conflict(error: &duckdb::Error, table_name: &str) 
         && message.contains(&format!(r#"attempting to create table "{table_name}""#))
 }
 
+/// Returns whether a DuckLake COMMIT error is a transient transaction conflict
+/// that can be safely retried (e.g. concurrent deletes on the same table index).
+pub(super) fn is_ducklake_transaction_conflict(error: &duckdb::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Failed to commit DuckLake transaction")
+        && message.contains("Transaction conflict")
+}
+
 /// Parses `expire_snapshots_older_than` into seconds for cheap metadata-only
 /// trigger sampling.
 fn expire_snapshots_retention_seconds(value: &str) -> Option<i64> {
@@ -1233,11 +1241,12 @@ where
 
             match result {
                 Ok(()) => conn.execute_batch("COMMIT").map_err(|e| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake COMMIT failed",
-                        source: e
-                    )
+                    let kind = if is_ducklake_transaction_conflict(&e) {
+                        ErrorKind::DestinationAtomicBatchRetryable
+                    } else {
+                        ErrorKind::DestinationQueryFailed
+                    };
+                    etl_error!(kind, "DuckLake COMMIT failed", source: e)
                 }),
                 Err(error) => {
                     let err = conn.execute_batch("ROLLBACK");
@@ -1305,11 +1314,12 @@ where
 
             match result {
                 Ok(()) => conn.execute_batch("COMMIT").map_err(|e| {
-                    etl_error!(
-                        ErrorKind::DestinationQueryFailed,
-                        "DuckLake COMMIT failed",
-                        source: e
-                    )
+                    let kind = if is_ducklake_transaction_conflict(&e) {
+                        ErrorKind::DestinationAtomicBatchRetryable
+                    } else {
+                        ErrorKind::DestinationQueryFailed
+                    };
+                    etl_error!(kind, "DuckLake COMMIT failed", source: e)
                 }),
                 Err(error) => {
                     let err = conn.execute_batch("ROLLBACK");
@@ -3323,6 +3333,44 @@ mod tests {
 
         assert!(is_create_table_conflict(&error, "public_users"));
         assert!(!is_create_table_conflict(&error, "public_orders"));
+    }
+
+    #[test]
+    fn is_ducklake_transaction_conflict_matches_delete_conflict() {
+        let error = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some(
+                "TransactionContext Error: Failed to commit: Failed to commit DuckLake \
+                 transaction. Transaction conflict - attempting to delete from table with \
+                 index \"1\" - but another transaction has deleted from it"
+                    .to_owned(),
+            ),
+        );
+        assert!(is_ducklake_transaction_conflict(&error));
+    }
+
+    #[test]
+    fn is_ducklake_transaction_conflict_matches_create_table_conflict() {
+        let error = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some(
+                "TransactionContext Error: Failed to commit: Failed to commit DuckLake \
+                 transaction. Transaction conflict - attempting to create table \
+                 \"public_users\" in schema \"main\" - but this table has been created by \
+                 another transaction already"
+                    .to_owned(),
+            ),
+        );
+        assert!(is_ducklake_transaction_conflict(&error));
+    }
+
+    #[test]
+    fn is_ducklake_transaction_conflict_rejects_unrelated_errors() {
+        let error = duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some("some other DuckDB error".to_owned()),
+        );
+        assert!(!is_ducklake_transaction_conflict(&error));
     }
 
     mod postgres_backed {

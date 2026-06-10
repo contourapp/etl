@@ -362,6 +362,21 @@ where
             }
         }
 
+        // Reset errored tables so they get a fresh sync attempt on restart.
+        // A pipeline restart is a natural retry boundary — if the underlying
+        // issue (e.g. a transient transaction conflict) has resolved, the table
+        // will recover automatically. If it hasn't, the table will error again
+        // quickly with a clear diagnostic.
+        for (table_id, state) in table_states.iter() {
+            if state.is_errored() {
+                info!(
+                    table_id = table_id.0,
+                    "resetting errored table to data_sync on pipeline restart",
+                );
+                self.store.update_table_state(*table_id, TableState::DataSync).await?;
+            }
+        }
+
         // Detect and purge tables that have been removed from the publication.
         //
         // The purging doesn't delete any data in the destination, it just removes
