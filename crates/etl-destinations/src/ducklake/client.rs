@@ -65,7 +65,14 @@ const DUCKLAKE_SHUTDOWN_REQUESTED: &str = "DuckLake shutdown requested";
 /// process (e.g. contour-core) that must stay alive even when a single DuckDB
 /// query gets stuck.
 pub(super) fn set_abort_on_blocking_timeout(abort: bool) {
-    ABORT_ON_BLOCKING_TIMEOUT.store(abort, Ordering::Relaxed);
+    let prev = ABORT_ON_BLOCKING_TIMEOUT.swap(abort, Ordering::Relaxed);
+    if prev != abort {
+        info!(
+            previous = prev,
+            current = abort,
+            "ABORT_ON_BLOCKING_TIMEOUT changed; last DuckLakeDestination constructor wins"
+        );
+    }
 }
 
 /// Reason recorded for the first interrupt sent to a DuckLake connection.
@@ -1253,8 +1260,14 @@ where
             // async side cannot mark it broken and return it to r2d2 for
             // eviction. If DuckDB does not return after interrupt plus grace,
             // the stuck native call also keeps holding its semaphore permit and
-            // blocking thread, so restarting the process is the recoverable
-            // boundary.
+            // blocking thread.
+            //
+            // When abort is enabled (standalone process), restarting the
+            // process is the recoverable boundary. When abort is disabled
+            // (embedded), returning an error leaks the permit, connection,
+            // and blocking thread — but keeps the host process alive.
+            // Repeated stuck operations will degrade capacity until the
+            // destination is effectively exhausted.
             if ABORT_ON_BLOCKING_TIMEOUT.load(Ordering::Relaxed) {
                 abort_stuck_duckdb_blocking_operation(operation_id, timeout, BLOCKING_ABORT_GRACE);
             } else {
