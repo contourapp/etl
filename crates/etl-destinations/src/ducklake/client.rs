@@ -49,7 +49,7 @@ static POSTGRES_PASSWORD_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Timeout applied to each foreground DuckLake blocking operation.
 // Contour: large initial loads and maintenance ops need more headroom.
-pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(super) const FOREGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// Stable log and error label for DuckDB blocking operations.
 const DUCKDB_BLOCKING_OPERATION_KIND: &str = "foreground";
 /// Extra time allowed for a timed-out DuckDB operation to return after
