@@ -87,6 +87,7 @@ async fn run(config: ReplicatorConfig) -> MaintenanceResult<()> {
         duckdb_memory_limit: env::var("ETL_DUCKLAKE_MAINTENANCE__DUCKDB_MEMORY_LIMIT").ok(),
         query_timeout: None,
         abort_on_timeout: true,
+        cancel: None,
         inline_flush: InlineFlushMaintenanceConfig {
             enabled: env_bool("ETL_DUCKLAKE_MAINTENANCE__INLINE_FLUSH__ENABLED", true),
             min_inlined_bytes: env_u64(

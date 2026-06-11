@@ -1481,6 +1481,11 @@ pub struct DuckLakeMaintenanceConfig {
     /// a timeout. Set to `false` to return an error instead, which is safer
     /// when maintenance runs in-process alongside the main pipeline.
     pub abort_on_timeout: bool,
+    /// Optional cooperative cancellation flag. When set mid-run, the runner
+    /// stops before dispatching the next operation or per-table query and
+    /// returns the partial outcome. An in-flight DuckDB query is not
+    /// interrupted.
+    pub cancel: Option<Arc<AtomicBool>>,
     /// Inline flush operation config.
     pub inline_flush: InlineFlushMaintenanceConfig,
     /// Merge-adjacent-files operation config.
@@ -1631,6 +1636,7 @@ pub async fn run_maintenance_once(
         "ducklake external maintenance discovered active tables"
     );
     let mut outcome = DuckLakeMaintenanceOutcome::default();
+    let cancel = config.cancel.clone();
 
     if config.inline_flush.enabled {
         run_inline_flush(
@@ -1639,24 +1645,26 @@ pub async fn run_maintenance_once(
             &metadata_schema,
             &table_names,
             config.inline_flush,
+            &cancel,
             &mut outcome,
         )
         .await?;
     }
 
-    if config.merge_adjacent_files.enabled {
+    if config.merge_adjacent_files.enabled && !maintenance_cancelled(&cancel) {
         run_merge_adjacent_files(
             &duckdb,
             &metadata_pg_pool,
             &metadata_schema,
             &table_names,
             &config.merge_adjacent_files,
+            &cancel,
             &mut outcome,
         )
         .await?;
     }
 
-    if config.rewrite_data_files.enabled {
+    if config.rewrite_data_files.enabled && !maintenance_cancelled(&cancel) {
         merge_adjacent_files_for_rewrite(&duckdb).await?;
         run_rewrite_data_files(
             &duckdb,
@@ -1664,21 +1672,35 @@ pub async fn run_maintenance_once(
             &metadata_schema,
             &table_names,
             config.rewrite_data_files,
+            &cancel,
             &mut outcome,
         )
         .await?;
     }
 
-    if config.expire_snapshots.enabled {
+    if config.expire_snapshots.enabled && !maintenance_cancelled(&cancel) {
         run_expire_snapshots(&duckdb, &config.expire_snapshots, &mut outcome).await?;
     }
 
-    if cleanup_old_files_enabled {
+    if cleanup_old_files_enabled && !maintenance_cancelled(&cancel) {
         run_cleanup_old_files(&duckdb, &mut outcome).await?;
+    }
+
+    if maintenance_cancelled(&cancel) {
+        info!(
+            outcome = ?outcome,
+            "ducklake external maintenance cancelled, returning partial outcome"
+        );
+        return Ok(outcome);
     }
 
     info!(outcome = ?outcome, applied = outcome.applied(), "ducklake external maintenance completed");
     Ok(outcome)
+}
+
+/// Returns `true` when the optional cooperative cancellation flag is set.
+fn maintenance_cancelled(cancel: &Option<Arc<AtomicBool>>) -> bool {
+    cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
 /// Validates one maintenance runner config.
@@ -1820,6 +1842,7 @@ async fn run_inline_flush(
     metadata_schema: &str,
     table_names: &[String],
     config: InlineFlushMaintenanceConfig,
+    cancel: &Option<Arc<AtomicBool>>,
     outcome: &mut DuckLakeMaintenanceOutcome,
 ) -> EtlResult<()> {
     info!(
@@ -1830,6 +1853,10 @@ async fn run_inline_flush(
     let sampler =
         DuckLakePendingInlineSizeSampler::new(metadata_schema.to_owned(), metadata_pg_pool.clone());
     for table_name in table_names {
+        if maintenance_cancelled(cancel) {
+            info!("ducklake inline flush cancelled before next table");
+            break;
+        }
         let sizes = sampler.sample_table(table_name).await?;
         if sizes.inlined_bytes < config.min_inlined_bytes {
             info!(
@@ -1872,6 +1899,7 @@ async fn run_merge_adjacent_files(
     metadata_schema: &str,
     table_names: &[String],
     config: &MergeAdjacentFilesMaintenanceConfig,
+    cancel: &Option<Arc<AtomicBool>>,
     outcome: &mut DuckLakeMaintenanceOutcome,
 ) -> EtlResult<()> {
     info!(
@@ -1903,6 +1931,10 @@ async fn run_merge_adjacent_files(
         "ducklake merge-adjacent-files selected tables"
     );
     for table_name in selected {
+        if maintenance_cancelled(cancel) {
+            info!("ducklake merge-adjacent-files cancelled before next table");
+            break;
+        }
         info!(
             table = %table_name,
             max_compacted_files = config.max_compacted_files,
@@ -1956,6 +1988,7 @@ async fn run_rewrite_data_files(
     metadata_schema: &str,
     table_names: &[String],
     config: RewriteDataFilesMaintenanceConfig,
+    cancel: &Option<Arc<AtomicBool>>,
     outcome: &mut DuckLakeMaintenanceOutcome,
 ) -> EtlResult<()> {
     info!(
@@ -1978,6 +2011,10 @@ async fn run_rewrite_data_files(
         "ducklake rewrite-data-files selected tables"
     );
     for table_name in selected {
+        if maintenance_cancelled(cancel) {
+            info!("ducklake rewrite-data-files cancelled before next table");
+            break;
+        }
         info!(
             table = %table_name,
             "ducklake rewrite-data-files executing"
