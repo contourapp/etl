@@ -1277,6 +1277,85 @@ where
         self.run_duckdb_blocking(crate::ducklake::batches::prune_streaming_progress_rows).await
     }
 
+    /// Drops superseded, empty inlined-data tables that inline flushes leave
+    /// registered in the catalog.
+    ///
+    /// The DuckLake extension's inlined-data reader crashes the process when
+    /// it initializes a scan over such a table (fixed upstream in
+    /// duckdb/ducklake@a3dd97c8, not yet in a published extension build).
+    /// This replicates the fixed behavior: every registered inlined-data
+    /// table below its data table's latest schema version is dropped once it
+    /// is empty. Must only run while pipeline writes are paused (see
+    /// [`Self::acquire_external_maintenance_pause`]).
+    pub async fn drop_superseded_empty_inlined_data_tables(&self) -> EtlResult<u32> {
+        let metadata_schema = self.metadata_schema.to_string();
+        let list_sql = format!(
+            "SELECT i.table_id, i.schema_version, i.table_name \
+             FROM {metadata_schema}.ducklake_inlined_data_tables i \
+             WHERE i.schema_version < ( \
+                 SELECT max(i2.schema_version) \
+                 FROM {metadata_schema}.ducklake_inlined_data_tables i2 \
+                 WHERE i2.table_id = i.table_id)"
+        );
+        let map_pg_error = |source: sqlx::Error| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake superseded inlined-data table cleanup failed",
+                source: source
+            )
+        };
+        let candidates: Vec<(i64, i64, String)> = sqlx::query_as(AssertSqlSafe(list_sql))
+            .fetch_all(&self.metadata_pg_pool)
+            .await
+            .map_err(map_pg_error)?;
+
+        let mut dropped: u32 = 0;
+        for (table_id, schema_version, inlined_table) in candidates {
+            // The table name is spliced into DDL below, so only accept names
+            // matching DuckLake's inlined-data naming scheme exactly.
+            if inlined_table != format!("ducklake_inlined_data_{table_id}_{schema_version}") {
+                warn!(
+                    inlined_table = %inlined_table,
+                    "ducklake inlined-data registry row has unexpected table name, skipping"
+                );
+                continue;
+            }
+            let mut tx = self.metadata_pg_pool.begin().await.map_err(map_pg_error)?;
+            let (row_count,): (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT count(*) FROM {metadata_schema}.\"{inlined_table}\""
+            )))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_pg_error)?;
+            if row_count != 0 {
+                continue;
+            }
+            sqlx::query(AssertSqlSafe(format!(
+                "DROP TABLE {metadata_schema}.\"{inlined_table}\""
+            )))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_error)?;
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {metadata_schema}.ducklake_inlined_data_tables \
+                 WHERE table_id = $1 AND schema_version = $2"
+            )))
+            .bind(table_id)
+            .bind(schema_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_pg_error)?;
+            tx.commit().await.map_err(map_pg_error)?;
+            info!(
+                inlined_table = %inlined_table,
+                "ducklake dropped superseded empty inlined-data table: {}",
+                inlined_table
+            );
+            dropped += 1;
+        }
+        Ok(dropped)
+    }
+
     /// Truncates the destination table while keeping its schema and name.
     async fn truncate_table_inner(
         &self,
@@ -2174,6 +2253,30 @@ where
             Arc::clone(&self.pool),
             Arc::clone(&self.blocking_slots),
             move |conn| -> EtlResult<()> {
+                // Skip DDL entirely when the table already exists: the
+                // storage ALTERs below bump the global DuckLake schema
+                // version even when nothing changes, which mints a new
+                // inlined-data table per process start. Changing a table's
+                // sort/partition config therefore requires a manual ALTER.
+                let exists_sql = format!(
+                    "SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = '{LAKE_CATALOG}' \
+                     AND table_name = {};",
+                    quote_literal(&table_name)
+                );
+                let already_exists: bool =
+                    conn.query_row(&exists_sql, [], |row| row.get(0)).map_err(|error| {
+                        etl_error!(
+                            ErrorKind::DestinationQueryFailed,
+                            "DuckLake table existence check failed",
+                            format_query_error_detail(&exists_sql),
+                            source: error
+                        )
+                    })?;
+                if already_exists {
+                    created_tables.lock().insert(table_name.clone());
+                    debug!(table = %table_name, "ducklake table already exists, skipping DDL");
+                    return Ok(());
+                }
                 debug!(table = %table_name, "ducklake create table begin");
                 match conn.execute_batch(&ddl) {
                     Ok(()) => {
