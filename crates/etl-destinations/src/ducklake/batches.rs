@@ -64,19 +64,13 @@ use crate::{
 /// Maximum number of rows per SQL `INSERT ... VALUES` batch when nested values
 /// force the staging path to bypass DuckDB's appender API.
 const SQL_INSERT_BATCH_SIZE: usize = 128;
-/// Maximum number of primary-key predicates per SQL `DELETE` batch.
-///
-/// Keep this small so each delete statement remains cheap while still avoiding
-/// one round-trip per deleted row.
-// Contour: larger batches reduce round-trips for high-throughput CDC.
-const SQL_DELETE_BATCH_SIZE: usize = 64;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
-/// Keeping mixed insert/delete/update streams in the same batch improves
-/// insert throughput on interleaved workloads while still capping transaction
-/// lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 128;
+/// Each batch pays at least one target-table scan for its MERGE and delete
+/// statements, so larger batches amortize that scan across far more mutations
+/// while still capping transaction lifetime for DuckLake conflict handling.
+const CDC_MUTATION_BATCH_SIZE: usize = 8192;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Inline small marker-table writes in the DuckLake metadata catalog instead of
@@ -113,15 +107,12 @@ impl error::Error for DuckDbSensitiveQueryError {}
 /// Formats query context for a delete mutation without row values.
 fn format_delete_mutation_error_detail(
     target_table: &str,
-    predicate_count: usize,
-    chunk_index: usize,
-    chunk_count: usize,
-    chunk_predicate_count: usize,
+    key_row_count: usize,
+    stage: &'static str,
 ) -> String {
     format!(
-        "sql: DELETE FROM {target_table} WHERE [redacted predicates]; predicate_count: \
-         {predicate_count}; chunk_index: {chunk_index}; chunk_count: {chunk_count}; \
-         chunk_predicate_count: {chunk_predicate_count}"
+        "sql: DELETE FROM {target_table} USING [redacted staged keys]; key_row_count: \
+         {key_row_count}; stage: {stage}"
     )
 }
 
@@ -172,8 +163,13 @@ pub(super) enum TableMutation {
 /// Prepared table mutations ready for execution and retries.
 enum PreparedTableMutation {
     Upsert(PreparedRows),
+    /// Staged delete: key rows load into a key-only temp table, then one
+    /// join-driven DELETE removes every staged key in a single target scan.
     Delete {
-        predicates: Vec<String>,
+        /// Replica-identity column names, in replicated table-column order.
+        identity_columns: Vec<String>,
+        /// One SQL literal per identity column for each deleted row.
+        key_rows: Vec<Vec<String>>,
         origin: &'static str,
     },
     Update {
@@ -1101,7 +1097,7 @@ fn prepare_table_mutations(
     let mut upsert_rows = Vec::new();
     let mut deduped_insert_rows = Vec::new();
     let mut merge_rows = Vec::new();
-    let mut delete_predicates = Vec::new();
+    let mut delete_key_rows: Vec<Vec<String>> = Vec::new();
 
     /// Flushes accumulated rows into their respective prepared mutations.
     macro_rules! flush_upserts {
@@ -1136,10 +1132,11 @@ fn prepare_table_mutations(
         };
     }
     macro_rules! flush_deletes {
-        ($prepared:expr, $preds:expr) => {
-            if !$preds.is_empty() {
+        ($prepared:expr, $key_rows:expr, $id_cols:expr) => {
+            if !$key_rows.is_empty() {
                 $prepared.push(PreparedTableMutation::Delete {
-                    predicates: std::mem::take(&mut $preds),
+                    identity_columns: $id_cols.clone(),
+                    key_rows: std::mem::take(&mut $key_rows),
                     origin: "delete",
                 });
             }
@@ -1149,7 +1146,7 @@ fn prepare_table_mutations(
     for mutation in mutations {
         match mutation {
             TableMutation::Insert(row) => {
-                flush_deletes!(prepared_mutations, delete_predicates);
+                flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
                 flush_merge_rows!(
                     prepared_mutations,
                     merge_rows,
@@ -1178,7 +1175,8 @@ fn prepare_table_mutations(
                     identity_columns,
                     all_columns
                 );
-                delete_predicates.push(delete_predicate_from_row(replicated_table_schema, &row)?);
+                delete_key_rows
+                    .push(delete_key_literals_from_row(replicated_table_schema, &row)?);
             }
             TableMutation::Update { delete_row, new_row } => {
                 flush_upserts!(prepared_mutations, upsert_rows, &column_schemas);
@@ -1188,18 +1186,33 @@ fn prepare_table_mutations(
                     &column_schemas,
                     identity_columns
                 );
-                flush_merge_rows!(
-                    prepared_mutations,
-                    merge_rows,
-                    &column_schemas,
-                    identity_columns,
-                    all_columns
-                );
-                flush_deletes!(prepared_mutations, delete_predicates);
                 match new_row {
+                    // Key-preserving full-row updates batch into the same
+                    // MERGE as Replace mutations, so a run of updates costs
+                    // one target scan instead of one per row.
+                    UpdatedTableRow::Full(upsert_row)
+                        if has_identity
+                            && update_preserves_identity(
+                                replicated_table_schema,
+                                &delete_row,
+                                &upsert_row,
+                            ) =>
+                    {
+                        flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
+                        merge_rows.push(upsert_row);
+                    }
                     UpdatedTableRow::Full(upsert_row) => {
+                        flush_merge_rows!(
+                            prepared_mutations,
+                            merge_rows,
+                            &column_schemas,
+                            identity_columns,
+                            all_columns
+                        );
+                        flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
                         prepared_mutations.push(PreparedTableMutation::Delete {
-                            predicates: vec![delete_predicate_from_row(
+                            identity_columns: identity_columns.clone(),
+                            key_rows: vec![delete_key_literals_from_row(
                                 replicated_table_schema,
                                 &delete_row,
                             )?],
@@ -1211,6 +1224,14 @@ fn prepare_table_mutations(
                         )));
                     }
                     UpdatedTableRow::Partial(partial_row) => {
+                        flush_merge_rows!(
+                            prepared_mutations,
+                            merge_rows,
+                            &column_schemas,
+                            identity_columns,
+                            all_columns
+                        );
+                        flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
                         prepared_mutations.push(PreparedTableMutation::Update {
                             assignments: update_assignments_from_partial_row(
                                 replicated_table_schema,
@@ -1232,7 +1253,7 @@ fn prepare_table_mutations(
                     &column_schemas,
                     identity_columns
                 );
-                flush_deletes!(prepared_mutations, delete_predicates);
+                flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
                 merge_rows.push(row);
             }
         }
@@ -1252,9 +1273,66 @@ fn prepare_table_mutations(
         identity_columns,
         all_columns
     );
-    flush_deletes!(prepared_mutations, delete_predicates);
+    flush_deletes!(prepared_mutations, delete_key_rows, identity_columns);
 
     Ok(prepared_mutations)
+}
+
+/// Returns whether an update's old replica-identity values equal the new
+/// row's, meaning the update can merge by identity instead of running a
+/// per-row delete + insert.
+///
+/// Conservatively returns `false` on any shape mismatch or NULL identity
+/// value so callers fall back to the predicate-based path.
+fn update_preserves_identity(
+    replicated_table_schema: &ReplicatedTableSchema,
+    delete_row: &OldTableRow,
+    new_row: &TableRow,
+) -> bool {
+    let replicated_column_schemas: Vec<_> = replicated_table_schema.column_schemas().collect();
+    let identity_column_schemas: Vec<_> =
+        replicated_table_schema.identity_column_schemas().collect();
+    if identity_column_schemas.is_empty()
+        || new_row.values().len() != replicated_column_schemas.len()
+    {
+        return false;
+    }
+
+    let identity_indices: Option<Vec<usize>> = identity_column_schemas
+        .iter()
+        .map(|identity_column| {
+            replicated_column_schemas
+                .iter()
+                .position(|column| column.ordinal_position == identity_column.ordinal_position)
+        })
+        .collect();
+    let Some(identity_indices) = identity_indices else {
+        return false;
+    };
+
+    let new_values: Vec<&Cell> =
+        identity_indices.iter().map(|&index| &new_row.values()[index]).collect();
+    let old_values: Vec<&Cell> = match delete_row {
+        OldTableRow::Full(row) => {
+            if row.values().len() != replicated_column_schemas.len() {
+                return false;
+            }
+            identity_indices.iter().map(|&index| &row.values()[index]).collect()
+        }
+        OldTableRow::Key(row) => {
+            if row.values().len() != identity_indices.len() {
+                return false;
+            }
+            row.values().iter().collect()
+        }
+    };
+
+    if new_values.iter().any(|value| matches!(value, Cell::Null))
+        || old_values.iter().any(|value| matches!(value, Cell::Null))
+    {
+        return false;
+    }
+    old_values == new_values
 }
 
 /// Builds a `WHERE` clause from the replica-identity values stored in `row`.
@@ -1262,6 +1340,36 @@ fn delete_predicate_from_row<'a>(
     replicated_table_schema: &ReplicatedTableSchema,
     row: impl Into<DeletePredicateRowRef<'a>>,
 ) -> EtlResult<String> {
+    let pairs = replica_identity_key_literals(replicated_table_schema, row)?;
+    Ok(pairs
+        .into_iter()
+        .map(|(quoted_column, literal)| {
+            if literal == "NULL" {
+                format!("{quoted_column} IS NULL")
+            } else {
+                format!("{quoted_column} = {literal}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND "))
+}
+
+/// Extracts the replica-identity SQL literals for one deleted row, in
+/// replicated table-column order.
+fn delete_key_literals_from_row<'a>(
+    replicated_table_schema: &ReplicatedTableSchema,
+    row: impl Into<DeletePredicateRowRef<'a>>,
+) -> EtlResult<Vec<String>> {
+    let pairs = replica_identity_key_literals(replicated_table_schema, row)?;
+    Ok(pairs.into_iter().map(|(_, literal)| literal).collect())
+}
+
+/// Extracts `(quoted column, SQL literal)` pairs for the replica-identity
+/// values stored in `row`.
+fn replica_identity_key_literals<'a>(
+    replicated_table_schema: &ReplicatedTableSchema,
+    row: impl Into<DeletePredicateRowRef<'a>>,
+) -> EtlResult<Vec<(String, String)>> {
     let row = row.into();
     let replicated_column_schemas: Vec<_> = replicated_table_schema.column_schemas().collect();
     let identity_column_schemas: Vec<_> =
@@ -1334,17 +1442,12 @@ fn delete_predicate_from_row<'a>(
         }
     };
 
-    let mut predicates = Vec::new();
-    for (column_schema, value) in key_values {
-        let quoted_column = quote_identifier(&column_schema.name);
-        let predicate = match value {
-            Cell::Null => format!("{quoted_column} IS NULL"),
-            _ => format!("{quoted_column} = {}", cell_to_sql_literal_ref(value)),
-        };
-        predicates.push(predicate);
-    }
-
-    Ok(predicates.join(" AND "))
+    Ok(key_values
+        .into_iter()
+        .map(|(column_schema, value)| {
+            (quote_identifier(&column_schema.name).to_string(), cell_to_sql_literal_ref(value))
+        })
+        .collect())
 }
 
 /// Builds SQL `SET` assignments from a partial update row.
@@ -2004,14 +2107,21 @@ fn apply_table_mutation(
             .record(prepared_rows_count(prepared_rows) as f64);
             apply_upsert_mutation(conn, prepared_rows, reusable_staging_table)
         }
-        PreparedTableMutation::Delete { predicates, origin } => {
+        PreparedTableMutation::Delete { identity_columns, key_rows, origin } => {
             histogram!(
                 ETL_DUCKLAKE_DELETE_PREDICATES,
                 BATCH_KIND_LABEL => batch.batch_kind.as_str(),
                 DELETE_ORIGIN_LABEL => *origin,
             )
-            .record(predicates.len() as f64);
-            apply_delete_mutation(conn, batch, predicates.as_slice(), origin, operation_context)
+            .record(key_rows.len() as f64);
+            apply_delete_mutation(
+                conn,
+                batch,
+                identity_columns.as_slice(),
+                key_rows.as_slice(),
+                origin,
+                operation_context,
+            )
         }
         PreparedTableMutation::Update { assignments, predicate } => apply_update_mutation(
             conn,
@@ -2201,62 +2311,93 @@ fn apply_merge_mutation(
 }
 
 /// Applies one delete batch inside an open DuckLake transaction.
+///
+/// Key rows load into a key-only temp table, then a single join-driven DELETE
+/// removes every staged key in one target scan instead of one scan per
+/// predicate chunk.
 fn apply_delete_mutation(
     conn: &duckdb::Connection,
     batch: &PreparedDuckLakeTableBatch,
-    predicates: &[String],
+    identity_columns: &[String],
+    key_rows: &[Vec<String>],
     origin: &'static str,
     operation_context: &DuckLakeBlockingOperationContext,
 ) -> EtlResult<()> {
-    if predicates.is_empty() {
+    if key_rows.is_empty() {
         return Ok(());
+    }
+    if identity_columns.is_empty() {
+        return Err(etl_error!(
+            ErrorKind::SourceReplicaIdentityError,
+            "DuckLake delete requires a replica identity",
+            format!("Table '{}' staged a delete without identity columns", batch.table_name)
+        ));
     }
 
     let target_table = qualified_lake_table_name(&batch.table_name);
-    let chunk_count = predicates.len().div_ceil(SQL_DELETE_BATCH_SIZE);
-    for (chunk_index, chunk) in predicates.chunks(SQL_DELETE_BATCH_SIZE).enumerate() {
-        let where_clause =
-            chunk.iter().map(|predicate| format!("({predicate})")).collect::<Vec<_>>().join(" OR ");
+    let staging_table = quote_identifier(&format!("__staging_delete_{}", batch.table_name));
+    let column_list = quoted_column_list(identity_columns);
 
-        let sql_query = format!("DELETE FROM {target_table} WHERE {where_clause};");
-        conn.execute_batch(&sql_query).map_err(|error| {
-            let duckdb_interrupted = is_duckdb_interrupt_error(&error);
-            tracing::error!(
-                error = %DuckDbSensitiveQueryError,
-                table = %batch.table_name,
-                batch_id = %batch.batch_id,
-                batch_kind = batch.batch_kind.as_str(),
-                first_start_lsn = %format_optional_lsn(batch.first_start_lsn),
-                last_commit_lsn = %format_optional_lsn(batch.last_commit_lsn),
-                first_sequence_key = %format_optional_sequence_key(batch.first_sequence_key),
-                last_sequence_key = %format_optional_sequence_key(batch.last_sequence_key),
-                delete_origin = origin,
-                delete_predicate_count = predicates.len(),
-                delete_chunk_index = chunk_index,
-                delete_chunk_count = chunk_count,
-                delete_chunk_predicate_count = chunk.len(),
-                duckdb_interrupted,
-                ducklake_interrupt_reason = operation_context.interrupt_reason_label(),
-                ducklake_operation_id = operation_context.operation_id(),
-                ducklake_operation_kind = operation_context.operation_kind(),
-                ducklake_operation_timeout_ms = operation_context.timeout_ms(),
-                "error DELETE FROM"
-            );
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake DELETE failed",
-                format_delete_mutation_error_detail(
-                    &target_table,
-                    predicates.len(),
-                    chunk_index,
-                    chunk_count,
-                    chunk.len(),
-                ),
-                source: DuckDbSensitiveQueryError
-            )
-        })?;
+    let map_delete_error = |error: Option<&duckdb::Error>, stage: &'static str| {
+        let duckdb_interrupted = error.is_some_and(is_duckdb_interrupt_error);
+        tracing::error!(
+            error = %DuckDbSensitiveQueryError,
+            table = %batch.table_name,
+            batch_id = %batch.batch_id,
+            batch_kind = batch.batch_kind.as_str(),
+            first_start_lsn = %format_optional_lsn(batch.first_start_lsn),
+            last_commit_lsn = %format_optional_lsn(batch.last_commit_lsn),
+            first_sequence_key = %format_optional_sequence_key(batch.first_sequence_key),
+            last_sequence_key = %format_optional_sequence_key(batch.last_sequence_key),
+            delete_origin = origin,
+            delete_key_row_count = key_rows.len(),
+            delete_stage = stage,
+            duckdb_interrupted,
+            ducklake_interrupt_reason = operation_context.interrupt_reason_label(),
+            ducklake_operation_id = operation_context.operation_id(),
+            ducklake_operation_kind = operation_context.operation_kind(),
+            ducklake_operation_timeout_ms = operation_context.timeout_ms(),
+            "error DELETE FROM"
+        );
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake DELETE failed",
+            format_delete_mutation_error_detail(&target_table, key_rows.len(), stage),
+            source: DuckDbSensitiveQueryError
+        )
+    };
+
+    conn.execute_batch(&format!(
+        "create or replace temp table {staging_table} as
+         select {column_list} from {target_table} limit 0;"
+    ))
+    .map_err(|error| map_delete_error(Some(&error), "create_staging"))?;
+
+    let row_literals: Vec<String> =
+        key_rows.iter().map(|row| format!("({})", row.join(", "))).collect();
+    for chunk in row_literals.chunks(SQL_INSERT_BATCH_SIZE) {
+        conn.execute_batch(&format!("INSERT INTO {staging_table} VALUES {};", chunk.join(", ")))
+            .map_err(|error| map_delete_error(Some(&error), "load_staging"))?;
     }
 
+    let join_clause = identity_columns
+        .iter()
+        .map(|column| {
+            let quoted = quote_identifier(column);
+            format!("{staging_table}.{quoted} IS NOT DISTINCT FROM target.{quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql_query = format!(
+        "DELETE FROM {target_table} AS target \
+         WHERE EXISTS (SELECT 1 FROM {staging_table} WHERE {join_clause});"
+    );
+    conn.execute_batch(&sql_query)
+        .map_err(|error| map_delete_error(Some(&error), "delete_join"))?;
+
+    if let Err(error) = conn.execute_batch(&format!("drop table if exists {staging_table};")) {
+        tracing::error!(error = %error, "error drop table delete staging");
+    }
     Ok(())
 }
 
@@ -2523,12 +2664,14 @@ mod tests {
         let batch = make_prepared_batch("users");
         let operation_context = DuckLakeBlockingOperationContext::for_tests();
         let sensitive_value = "alice@example.com";
-        let predicates = vec![format!("\"email\" = '{sensitive_value}'")];
+        let identity_columns = vec!["email".to_owned()];
+        let key_rows = vec![vec![format!("'{sensitive_value}'")]];
 
         let error = apply_delete_mutation(
             &conn,
             &batch,
-            predicates.as_slice(),
+            identity_columns.as_slice(),
+            key_rows.as_slice(),
             "delete",
             &operation_context,
         )
@@ -2661,7 +2804,7 @@ mod tests {
 
         assert_eq!(prepared.len(), 1);
         match &prepared[0] {
-            PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
+            PreparedTableMutation::Merge { rows, identity_columns, all_columns, .. } => {
                 assert_eq!(identity_columns, &vec!["id".to_owned()]);
                 assert_eq!(all_columns.len(), 2);
                 match rows {
@@ -2953,11 +3096,12 @@ mod tests {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
                 assert_eq!(prepared.len(), 1);
                 match &prepared[0] {
-                    PreparedTableMutation::Delete { predicates, origin } => {
+                    PreparedTableMutation::Delete { identity_columns, key_rows, origin } => {
                         assert_eq!(origin, &"delete");
+                        assert_eq!(identity_columns, &vec!["id".to_owned()]);
                         assert_eq!(
-                            predicates,
-                            &vec!["\"id\" = 1".to_owned(), "\"id\" = 2".to_owned()]
+                            key_rows,
+                            &vec![vec!["1".to_owned()], vec!["2".to_owned()]]
                         );
                     }
                     _ => panic!("expected delete batch"),
@@ -3011,17 +3155,19 @@ mod tests {
         assert_eq!(batches.len(), 1);
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 4);
-                assert!(matches!(prepared[0], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[1],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(prepared[2], PreparedTableMutation::Delete { .. }));
-                assert!(matches!(
-                    prepared[3],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
+                // Key-preserving updates batch into one MERGE so a run of
+                // updates costs a single target scan.
+                assert_eq!(prepared.len(), 1);
+                match &prepared[0] {
+                    PreparedTableMutation::Merge { rows, identity_columns, .. } => {
+                        assert_eq!(identity_columns, &vec!["id".to_owned()]);
+                        match rows {
+                            PreparedRows::Appender(rows) => assert_eq!(rows.len(), 2),
+                            PreparedRows::SqlLiterals(rows) => assert_eq!(rows.len(), 2),
+                        }
+                    }
+                    _ => panic!("expected merge batch"),
+                }
             }
             PreparedDuckLakeTableBatchAction::Truncate => panic!("expected mutation batch"),
         }
@@ -3054,8 +3200,8 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), CDC_MUTATION_BATCH_SIZE);
+                PreparedTableMutation::Delete { key_rows, .. } => {
+                    assert_eq!(key_rows.len(), CDC_MUTATION_BATCH_SIZE);
                 }
                 _ => panic!("expected delete batch"),
             },
@@ -3064,8 +3210,8 @@ mod tests {
 
         match &batches[1].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => match &prepared[0] {
-                PreparedTableMutation::Delete { predicates, .. } => {
-                    assert_eq!(predicates.len(), 1);
+                PreparedTableMutation::Delete { key_rows, .. } => {
+                    assert_eq!(key_rows.len(), 1);
                 }
                 _ => panic!("expected delete batch"),
             },
@@ -3074,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_mutation_table_batches_isolate_update_in_its_own_atomic_batch() {
+    fn prepare_mutation_table_batches_merge_key_preserving_update_between_inserts() {
         let replicated_table_schema = make_replicated_schema();
         let batches = prepare_mutation_table_batches(
             &replicated_table_schema,
@@ -3121,18 +3267,14 @@ mod tests {
 
         match &batches[0].action {
             PreparedDuckLakeTableBatchAction::Mutation(prepared) => {
-                assert_eq!(prepared.len(), 4);
+                assert_eq!(prepared.len(), 3);
                 assert!(matches!(
                     prepared[0],
                     PreparedTableMutation::DedupedUpsert { .. }
                 ));
-                assert!(matches!(prepared[1], PreparedTableMutation::Delete { .. }));
+                assert!(matches!(prepared[1], PreparedTableMutation::Merge { .. }));
                 assert!(matches!(
                     prepared[2],
-                    PreparedTableMutation::Upsert(PreparedRows::Appender(_))
-                ));
-                assert!(matches!(
-                    prepared[3],
                     PreparedTableMutation::DedupedUpsert { .. }
                 ));
             }
