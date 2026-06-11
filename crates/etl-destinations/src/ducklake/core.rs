@@ -1269,6 +1269,14 @@ where
         Ok(())
     }
 
+    /// Removes superseded streaming-progress watermark rows, keeping the
+    /// latest row per table. Must only run while pipeline writes are paused
+    /// (see [`Self::acquire_external_maintenance_pause`]) because it deletes
+    /// inlined data that concurrent batch commits depend on.
+    pub async fn prune_streaming_progress(&self) -> EtlResult<usize> {
+        self.run_duckdb_blocking(crate::ducklake::batches::prune_streaming_progress_rows).await
+    }
+
     /// Truncates the destination table while keeping its schema and name.
     async fn truncate_table_inner(
         &self,

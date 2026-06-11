@@ -782,6 +782,34 @@ pub(super) fn clear_table_streaming_progress(
     Ok(())
 }
 
+/// Deletes superseded streaming-progress watermark rows, keeping the latest
+/// row per table.
+///
+/// Progress writes are append-only to keep concurrent batch commits
+/// conflict-free, so superseded rows accumulate until this prune runs. Only
+/// call while pipeline writes are paused: the delete removes inlined data
+/// that concurrently committing batches would otherwise conflict with.
+pub(super) fn prune_streaming_progress_rows(conn: &duckdb::Connection) -> EtlResult<usize> {
+    let sql = format!(
+        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" AS p
+         WHERE EXISTS (
+             SELECT 1 FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}" newer
+             WHERE newer.table_name = p.table_name
+               AND (newer.last_commit_lsn > p.last_commit_lsn
+                    OR (newer.last_commit_lsn = p.last_commit_lsn
+                        AND newer.last_tx_ordinal > p.last_tx_ordinal))
+         );"#
+    );
+    conn.execute(&sql, []).map_err(|err| {
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake streaming progress prune failed",
+            format_query_error_detail(&sql),
+            source: err
+        )
+    })
+}
+
 /// Applies jitter to one DuckLake retry delay.
 fn jitter_ducklake_retry_delay(base_delay: Duration) -> Duration {
     let jitter_ratio = rand::rng().random_range(0.5..=1.5_f64);
@@ -818,7 +846,8 @@ fn read_table_streaming_progress(
     let sql = format!(
         r#"SELECT last_commit_lsn, last_tx_ordinal
          FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
-         WHERE table_name = {} LIMIT 1;"#,
+         WHERE table_name = {}
+         ORDER BY last_commit_lsn DESC, last_tx_ordinal DESC LIMIT 1;"#,
         quote_literal(table_name),
     );
     let mut statement = conn.prepare(&sql).map_err(|err| {
@@ -1795,13 +1824,15 @@ fn update_table_streaming_progress(
             format!("table={}, batch_kind={}", batch.table_name, batch.batch_kind.as_str())
         )
     })?;
+    // Append-only on purpose: the progress table is shared by every table's
+    // batch transaction, and a DELETE here removes inlined data that any
+    // concurrently committing batch depends on, failing its commit with a
+    // DuckLake transaction conflict. Readers take the latest row per table;
+    // superseded rows are pruned during paused maintenance.
     let sql = format!(
-        r#"DELETE FROM {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
-         WHERE table_name = {};
-         INSERT INTO {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
+        r#"INSERT INTO {LAKE_CATALOG}."{STREAMING_PROGRESS_TABLE}"
          (table_name, last_commit_lsn, last_tx_ordinal, updated_at)
          VALUES ({}, {}, {}, current_timestamp);"#,
-        quote_literal(&batch.table_name),
         quote_literal(&batch.table_name),
         u64::from(last_sequence_key.commit_lsn),
         last_sequence_key.tx_ordinal,
