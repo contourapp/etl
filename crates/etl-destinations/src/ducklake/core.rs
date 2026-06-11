@@ -170,6 +170,12 @@ pub struct DuckLakeDestination<S> {
     streaming_progress_table_created: Arc<AtomicBool>,
     /// Per-table sort keys and partition expressions applied after CREATE TABLE.
     table_storage_config: Arc<HashMap<String, crate::ducklake::schema::TableStorageConfig>>,
+    /// Tables whose `data_inlining_row_limit` was set to zero for the copy
+    /// phase so copy batches write directly to Parquet.
+    copy_inlining_zeroed: Arc<Mutex<HashSet<DuckLakeTableName>>>,
+    /// Tables whose `data_inlining_row_limit` was restored to the attach-time
+    /// default once streaming writes began.
+    streaming_inlining_restored: Arc<Mutex<HashSet<DuckLakeTableName>>>,
 }
 
 /// Held by an external DuckLake maintenance coordinator while foreground
@@ -1119,6 +1125,8 @@ where
             applied_batches_table_created: Arc::default(),
             streaming_progress_table_created: Arc::default(),
             table_storage_config: Arc::new(tables),
+            copy_inlining_zeroed: Arc::default(),
+            streaming_inlining_restored: Arc::default(),
         };
         gauge!(ETL_DUCKLAKE_POOL_SIZE).set(pool_size as f64);
         let shutdown_signal_manager = Arc::clone(&manager);
@@ -1187,6 +1195,78 @@ where
         }
 
         Ok(destination)
+    }
+
+    /// Sets one table's DuckLake `data_inlining_row_limit` catalog option.
+    async fn set_table_data_inlining_row_limit(
+        &self,
+        table_name: &str,
+        limit: u64,
+    ) -> EtlResult<()> {
+        let sql = format!(
+            "CALL {LAKE_CATALOG}.set_option('data_inlining_row_limit', {limit}, table_name => \
+             {});",
+            quote_literal(table_name)
+        );
+        self.run_duckdb_blocking(move |conn| -> EtlResult<()> {
+            conn.execute_batch(&sql).map_err(|source| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake set_option failed",
+                    format_query_error_detail(&sql),
+                    source: source
+                )
+            })
+        })
+        .await
+    }
+
+    /// Disables data inlining for one table while its initial copy runs, so
+    /// copy batches write directly to Parquet instead of accumulating inline
+    /// rows in the catalog. Memoized per process; callers must hold the
+    /// table's write slot.
+    async fn ensure_copy_inlining_disabled(
+        &self,
+        table_name: &DuckLakeTableName,
+    ) -> EtlResult<()> {
+        if self.copy_inlining_zeroed.lock().contains(table_name) {
+            return Ok(());
+        }
+        self.set_table_data_inlining_row_limit(table_name, 0).await?;
+        info!(
+            table = %table_name,
+            "ducklake data inlining disabled for table copy: table={}",
+            table_name
+        );
+        self.copy_inlining_zeroed.lock().insert(table_name.clone());
+        self.streaming_inlining_restored.lock().remove(table_name);
+        Ok(())
+    }
+
+    /// Restores the attach-time data inlining limit for one table once
+    /// streaming writes begin after its copy phase. Runs once per table per
+    /// process so a restore lost to a crash self-heals on restart. Callers
+    /// must hold the table's write slot.
+    async fn ensure_streaming_inlining_restored(
+        &self,
+        table_name: &DuckLakeTableName,
+    ) -> EtlResult<()> {
+        if self.streaming_inlining_restored.lock().contains(table_name) {
+            return Ok(());
+        }
+        self.set_table_data_inlining_row_limit(
+            table_name,
+            crate::ducklake::ATTACH_DATA_INLINING_ROW_LIMIT,
+        )
+        .await?;
+        info!(
+            table = %table_name,
+            "ducklake data inlining restored for streaming: table={}",
+            table_name
+        );
+        self.streaming_inlining_restored.lock().insert(table_name.clone());
+        self.copy_inlining_zeroed.lock().remove(table_name);
+        Ok(())
     }
 
     /// Truncates the destination table while keeping its schema and name.
@@ -1364,6 +1444,7 @@ where
         self.ensure_applied_batches_table_exists().await?;
         let _table_write_permit = self.acquire_table_write_slot(&table_name).await?;
         let _checkpoint_guard = self.acquire_mutation_guard().await;
+        self.ensure_copy_inlining_disabled(&table_name).await?;
         let prepared_batch =
             prepare_copy_table_batch(replicated_table_schema, table_name, table_rows)?;
         apply_table_batch_with_retry(
@@ -1882,6 +1963,9 @@ where
                                 destination_table_name,
                                 checkpoint_wait.as_millis()
                             );
+                            destination
+                                .ensure_streaming_inlining_restored(&destination_table_name)
+                                .await?;
                             let last_sequence_key =
                                 read_table_streaming_progress_sequence_key_blocking(
                                     Arc::clone(&destination.pool),
