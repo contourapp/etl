@@ -539,6 +539,7 @@ fn build_setup_plan(
     data_path: &Url,
     s3: Option<&S3Config>,
     metadata_schema: Option<&str>,
+    duckdb_memory_limit: Option<&str>,
 ) -> EtlResult<DuckLakeSetupPlan> {
     let strategy = current_duckdb_extension_strategy()?;
     let vendored_root = match strategy {
@@ -557,6 +558,7 @@ fn build_setup_plan(
         data_path,
         s3,
         metadata_schema,
+        duckdb_memory_limit,
         strategy,
         vendored_root.as_deref(),
     )
@@ -567,6 +569,7 @@ fn build_setup_plan_with_strategy(
     data_path: &Url,
     s3: Option<&S3Config>,
     metadata_schema: Option<&str>,
+    duckdb_memory_limit: Option<&str>,
     strategy: DuckDbExtensionStrategy,
     vendored_root: Option<&Path>,
 ) -> EtlResult<DuckLakeSetupPlan> {
@@ -580,6 +583,12 @@ fn build_setup_plan_with_strategy(
         label: "configure_writer_session",
         sql: configure_writer_session_sql(),
     }];
+    if let Some(limit) = duckdb_memory_limit {
+        steps.push(DuckLakeSetupStep {
+            label: "configure_memory_limit",
+            sql: format!("SET memory_limit = '{limit}';"),
+        });
+    }
     let mut secret_options = BTreeMap::from([
         ("KEY_ID", quote_literal(s3.map(|s| s.access_key_id.as_str()).unwrap_or_default())),
         ("REGION", quote_literal(s3.map(|s| s.region.as_str()).unwrap_or_default())),
@@ -1463,6 +1472,10 @@ pub struct DuckLakeMaintenanceConfig {
     /// Per-query timeout for DuckDB maintenance operations. Defaults to
     /// `MAINTENANCE_QUERY_TIMEOUT` (6 minutes) when `None`.
     pub query_timeout: Option<Duration>,
+    /// Optional DuckDB memory limit (e.g. `"2GB"`). When `None`, DuckDB uses
+    /// its default (80% of system RAM), which can cause OOM when the
+    /// maintenance instance runs alongside the write pool.
+    pub duckdb_memory_limit: Option<String>,
     /// When `true` (the default), the runner calls `process::abort()` if a
     /// DuckDB operation does not return within the interrupt grace period after
     /// a timeout. Set to `false` to return an error instead, which is safer
@@ -1740,6 +1753,7 @@ async fn open_maintenance_executor(
         &config.data_path,
         config.s3.as_ref(),
         config.metadata_schema.as_deref(),
+        config.duckdb_memory_limit.as_deref(),
     )?);
     let manager = DuckLakeConnectionManager {
         setup_plan,

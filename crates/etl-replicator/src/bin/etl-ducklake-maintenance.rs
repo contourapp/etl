@@ -84,6 +84,7 @@ async fn run(config: ReplicatorConfig) -> MaintenanceResult<()> {
         s3,
         metadata_schema,
         maintenance_target_file_size,
+        duckdb_memory_limit: env::var("ETL_DUCKLAKE_MAINTENANCE__DUCKDB_MEMORY_LIMIT").ok(),
         query_timeout: None,
         abort_on_timeout: true,
         inline_flush: InlineFlushMaintenanceConfig {
