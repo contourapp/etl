@@ -144,11 +144,11 @@ const STREAMING_PROGRESS_TABLE: &str = "__etl_streaming_progress";
 /// of materializing files for this metadata-like table.
 const STREAMING_PROGRESS_TABLE_DATA_INLINING_ROW_LIMIT: usize = 256;
 /// Maximum number of times a failed write attempt is retried before giving up.
-const MAX_COMMIT_RETRIES: u32 = 10;
+const MAX_COMMIT_RETRIES: u32 = 15;
 /// Initial backoff duration before the first retry.
 const INITIAL_RETRY_DELAY_MS: u64 = 50;
 /// Upper bound on backoff duration.
-const MAX_RETRY_DELAY_MS: u64 = 2_000;
+const MAX_RETRY_DELAY_MS: u64 = 10_000;
 /// Minimum retry delay for transient delete-file visibility failures.
 const TRANSIENT_DELETE_FILE_RETRY_DELAY_MS: u64 = 5_000;
 
