@@ -1,12 +1,26 @@
 //! Arrow RecordBatch staging for DuckLake batch writes.
 
-use duckdb::arrow::datatypes::{DataType, Field, Fields, TimeUnit};
+use std::sync::Arc;
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use duckdb::arrow::array::{
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
+    PrimitiveBuilder, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, UInt32Builder,
+};
+use duckdb::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Fields, Schema, TimeUnit};
+use duckdb::arrow::record_batch::RecordBatch;
 use etl::{
     error::{ErrorKind, EtlResult},
     etl_error,
-    types::{ColumnSchema, Type, is_array_type, is_range_array_type, is_range_type},
+    types::{
+        ArrayCell, Cell, ColumnSchema, PgNumeric, TableRow, Type, is_array_type,
+        is_range_array_type, is_range_type,
+    },
 };
 
+use crate::ducklake::encoding::{ParsedRange, parse_range_array_text, parse_range_text};
 use crate::ducklake::sql::quote_identifier;
 
 /// How a staged column reaches its target type in consuming SQL.
@@ -362,6 +376,753 @@ mod numeric_tests {
     #[test]
     fn decimal_text_scientific_notation_errors() {
         assert!(decimal_text_to_i128("1e5").is_err());
+    }
+}
+
+/// Builds one RecordBatch for the staging table from prepared rows.
+/// Column-oriented: one typed builder per spec, fed from every row.
+#[allow(dead_code)]
+pub(super) fn build_record_batch(
+    specs: &[StagingColumnSpec],
+    rows: &[TableRow],
+) -> EtlResult<RecordBatch> {
+    let mut fields = Vec::with_capacity(specs.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(specs.len());
+    for (index, spec) in specs.iter().enumerate() {
+        fields.push(Field::new(spec.name.as_str(), spec.arrow_type.clone(), true));
+        arrays.push(build_column(spec, index, rows)?);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|error| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Failed to assemble Arrow record batch for staging",
+            error.to_string()
+        )
+    })
+}
+
+/// Builds the typed Arrow array for one staged column across all rows.
+fn build_column(spec: &StagingColumnSpec, index: usize, rows: &[TableRow]) -> EtlResult<ArrayRef> {
+    let name = spec.name.as_str();
+    macro_rules! primitive_column {
+        ($builder:expr, $variant:ident, $conv:expr) => {
+            build_primitive_column(rows, index, name, $builder, |cell| match cell {
+                Cell::Null => Ok(None),
+                Cell::$variant(value) => Ok(Some($conv(value))),
+                other => Err(unexpected_cell(name, other)),
+            })
+        };
+    }
+    match &spec.arrow_type {
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::with_capacity(rows.len());
+            for row in rows {
+                match cell_at(row, index, name)? {
+                    Cell::Null => builder.append_null(),
+                    Cell::Bool(value) => builder.append_value(*value),
+                    other => return Err(unexpected_cell(name, other)),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int16 => primitive_column!(Int16Builder::new(), I16, |v: &i16| *v),
+        DataType::Int32 => primitive_column!(Int32Builder::new(), I32, |v: &i32| *v),
+        DataType::UInt32 => primitive_column!(UInt32Builder::new(), U32, |v: &u32| *v),
+        DataType::Int64 => primitive_column!(Int64Builder::new(), I64, |v: &i64| *v),
+        DataType::Float32 => primitive_column!(Float32Builder::new(), F32, |v: &f32| *v),
+        DataType::Float64 => primitive_column!(Float64Builder::new(), F64, |v: &f64| *v),
+        DataType::Decimal128(precision, scale) => build_primitive_column(
+            rows,
+            index,
+            name,
+            decimal_builder(*precision, *scale)?,
+            |cell| match cell {
+                Cell::Null => Ok(None),
+                Cell::Numeric(numeric) => numeric_to_mantissa(numeric),
+                other => Err(unexpected_cell(name, other)),
+            },
+        ),
+        DataType::Date32 => primitive_column!(Date32Builder::new(), Date, date_to_days),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            primitive_column!(Time64MicrosecondBuilder::new(), Time, time_to_micros)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => primitive_column!(
+            TimestampMicrosecondBuilder::new(),
+            Timestamp,
+            |dt: &NaiveDateTime| dt.and_utc().timestamp_micros()
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => primitive_column!(
+            TimestampMicrosecondBuilder::new().with_timezone(Arc::clone(tz)),
+            TimestampTz,
+            |dt: &DateTime<Utc>| dt.timestamp_micros()
+        ),
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in rows {
+                match cell_at(row, index, name)? {
+                    Cell::Null => builder.append_null(),
+                    Cell::String(value) => builder.append_value(value),
+                    Cell::Uuid(value) => builder.append_value(value.to_string()),
+                    Cell::Json(value) => builder.append_value(value.to_string()),
+                    other => return Err(unexpected_cell(name, other)),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::new();
+            for row in rows {
+                match cell_at(row, index, name)? {
+                    Cell::Null => builder.append_null(),
+                    Cell::Bytes(value) => builder.append_value(value),
+                    other => return Err(unexpected_cell(name, other)),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Struct(fields) => build_range_struct_column(name, fields, index, rows),
+        DataType::List(item) => match item.data_type() {
+            DataType::Struct(fields) => build_range_list_column(name, item, fields, index, rows),
+            element => build_scalar_list_column(name, item, element, index, rows),
+        },
+        other => Err(unsupported_arrow_type(name, other)),
+    }
+}
+
+/// Builds a primitive column by extracting one native value per row.
+fn build_primitive_column<T: ArrowPrimitiveType>(
+    rows: &[TableRow],
+    index: usize,
+    name: &str,
+    mut builder: PrimitiveBuilder<T>,
+    extract: impl Fn(&Cell) -> EtlResult<Option<T::Native>>,
+) -> EtlResult<ArrayRef> {
+    for row in rows {
+        match extract(cell_at(row, index, name)?)? {
+            Some(value) => builder.append_value(value),
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Builds a list column by appending the elements of each row's ArrayCell.
+fn build_list_column<B: ArrayBuilder>(
+    rows: &[TableRow],
+    index: usize,
+    name: &str,
+    item: Arc<Field>,
+    values: B,
+    append_elements: impl Fn(&mut B, &ArrayCell) -> EtlResult<()>,
+) -> EtlResult<ArrayRef> {
+    let mut builder = ListBuilder::new(values).with_field(item);
+    for row in rows {
+        match cell_at(row, index, name)? {
+            Cell::Null => builder.append(false),
+            Cell::Array(array) => {
+                append_elements(builder.values(), array)?;
+                builder.append(true);
+            }
+            other => return Err(unexpected_cell(name, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Builds a list column for scalar (non-range) element types.
+fn build_scalar_list_column(
+    name: &str,
+    item: &Arc<Field>,
+    element: &DataType,
+    index: usize,
+    rows: &[TableRow],
+) -> EtlResult<ArrayRef> {
+    macro_rules! primitive_list_column {
+        ($builder:expr, $variant:ident, $conv:expr) => {
+            build_list_column(rows, index, name, Arc::clone(item), $builder, |values, array| {
+                match array {
+                    ArrayCell::$variant(elements) => {
+                        for element in elements {
+                            match element {
+                                Some(value) => values.append_value($conv(value)),
+                                None => values.append_null(),
+                            }
+                        }
+                        Ok(())
+                    }
+                    other => Err(unexpected_cell_in_array(name, other)),
+                }
+            })
+        };
+    }
+    match element {
+        DataType::Boolean => {
+            primitive_list_column!(BooleanBuilder::new(), Bool, |v: &bool| *v)
+        }
+        DataType::Int16 => primitive_list_column!(Int16Builder::new(), I16, |v: &i16| *v),
+        DataType::Int32 => primitive_list_column!(Int32Builder::new(), I32, |v: &i32| *v),
+        DataType::UInt32 => primitive_list_column!(UInt32Builder::new(), U32, |v: &u32| *v),
+        DataType::Int64 => primitive_list_column!(Int64Builder::new(), I64, |v: &i64| *v),
+        DataType::Float32 => primitive_list_column!(Float32Builder::new(), F32, |v: &f32| *v),
+        DataType::Float64 => primitive_list_column!(Float64Builder::new(), F64, |v: &f64| *v),
+        DataType::Decimal128(precision, scale) => build_list_column(
+            rows,
+            index,
+            name,
+            Arc::clone(item),
+            decimal_builder(*precision, *scale)?,
+            |values, array| match array {
+                ArrayCell::Numeric(elements) => {
+                    for element in elements {
+                        match element.as_ref().map(numeric_to_mantissa).transpose()?.flatten() {
+                            Some(mantissa) => values.append_value(mantissa),
+                            None => values.append_null(),
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(unexpected_cell_in_array(name, other)),
+            },
+        ),
+        DataType::Date32 => primitive_list_column!(Date32Builder::new(), Date, date_to_days),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            primitive_list_column!(Time64MicrosecondBuilder::new(), Time, time_to_micros)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => primitive_list_column!(
+            TimestampMicrosecondBuilder::new(),
+            Timestamp,
+            |dt: &NaiveDateTime| dt.and_utc().timestamp_micros()
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => primitive_list_column!(
+            TimestampMicrosecondBuilder::new().with_timezone(Arc::clone(tz)),
+            TimestampTz,
+            |dt: &DateTime<Utc>| dt.timestamp_micros()
+        ),
+        DataType::Utf8 => build_list_column(
+            rows,
+            index,
+            name,
+            Arc::clone(item),
+            StringBuilder::new(),
+            |values, array| {
+                match array {
+                    ArrayCell::String(elements) => {
+                        for element in elements {
+                            values.append_option(element.as_deref());
+                        }
+                    }
+                    ArrayCell::Uuid(elements) => {
+                        for element in elements {
+                            values.append_option(element.map(|value| value.to_string()));
+                        }
+                    }
+                    ArrayCell::Json(elements) => {
+                        for element in elements {
+                            values.append_option(element.as_ref().map(|value| value.to_string()));
+                        }
+                    }
+                    other => return Err(unexpected_cell_in_array(name, other)),
+                }
+                Ok(())
+            },
+        ),
+        DataType::Binary => build_list_column(
+            rows,
+            index,
+            name,
+            Arc::clone(item),
+            BinaryBuilder::new(),
+            |values, array| match array {
+                ArrayCell::Bytes(elements) => {
+                    for element in elements {
+                        match element {
+                            Some(value) => values.append_value(value),
+                            None => values.append_null(),
+                        }
+                    }
+                    Ok(())
+                }
+                other => Err(unexpected_cell_in_array(name, other)),
+            },
+        ),
+        other => Err(unsupported_arrow_type(name, other)),
+    }
+}
+
+/// Builds a struct column for a scalar range type.
+fn build_range_struct_column(
+    name: &str,
+    fields: &Fields,
+    index: usize,
+    rows: &[TableRow],
+) -> EtlResult<ArrayRef> {
+    let bound_type = fields[0].data_type().clone();
+    let mut builder = StructBuilder::from_fields(fields.clone(), rows.len());
+    for row in rows {
+        match cell_at(row, index, name)? {
+            Cell::Null => append_null_range_struct(&mut builder, &bound_type, name)?,
+            Cell::String(text) => {
+                append_parsed_range(&mut builder, &bound_type, parse_range_text(text), name)?;
+            }
+            other => return Err(unexpected_cell(name, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Builds a list-of-struct column for a range array type.
+fn build_range_list_column(
+    name: &str,
+    item: &Arc<Field>,
+    fields: &Fields,
+    index: usize,
+    rows: &[TableRow],
+) -> EtlResult<ArrayRef> {
+    let bound_type = fields[0].data_type().clone();
+    let mut builder = ListBuilder::new(StructBuilder::from_fields(fields.clone(), 0))
+        .with_field(Arc::clone(item));
+    for row in rows {
+        match cell_at(row, index, name)? {
+            Cell::Null => builder.append(false),
+            Cell::String(text) => {
+                for parsed in parse_range_array_text(text) {
+                    append_parsed_range(builder.values(), &bound_type, parsed, name)?;
+                }
+                builder.append(true);
+            }
+            // CDC decodes range arrays as ArrayCell::String where each
+            // element is a single range text like "[lower,upper)".
+            Cell::Array(ArrayCell::String(elements)) => {
+                for element in elements {
+                    match element {
+                        Some(text) => append_parsed_range(
+                            builder.values(),
+                            &bound_type,
+                            parse_range_text(text),
+                            name,
+                        )?,
+                        None => append_null_range_struct(builder.values(), &bound_type, name)?,
+                    }
+                }
+                builder.append(true);
+            }
+            other => return Err(unexpected_cell(name, other)),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Appends a parsed range to a range struct builder: empty ranges become
+/// NULL structs, unbounded sides become NULL fields.
+fn append_parsed_range(
+    builder: &mut StructBuilder,
+    bound_type: &DataType,
+    parsed: ParsedRange,
+    name: &str,
+) -> EtlResult<()> {
+    match parsed {
+        ParsedRange::Empty => append_null_range_struct(builder, bound_type, name),
+        ParsedRange::Bounds(lower, upper) => {
+            append_range_bound(builder, 0, bound_type, lower.as_deref(), name)?;
+            append_range_bound(builder, 1, bound_type, upper.as_deref(), name)?;
+            builder.append(true);
+            Ok(())
+        }
+    }
+}
+
+/// Appends a NULL struct, keeping child builder lengths aligned.
+fn append_null_range_struct(
+    builder: &mut StructBuilder,
+    bound_type: &DataType,
+    name: &str,
+) -> EtlResult<()> {
+    append_range_bound(builder, 0, bound_type, None, name)?;
+    append_range_bound(builder, 1, bound_type, None, name)?;
+    builder.append(false);
+    Ok(())
+}
+
+/// Appends one range bound (lower = field 0, upper = field 1), parsing the
+/// Postgres bound text into the struct field's arrow type.
+fn append_range_bound(
+    builder: &mut StructBuilder,
+    field_index: usize,
+    bound_type: &DataType,
+    bound: Option<&str>,
+    name: &str,
+) -> EtlResult<()> {
+    match bound_type {
+        DataType::Int32 => {
+            let parsed = bound
+                .map(|text| text.trim().parse::<i32>().map_err(|_| invalid_range_bound(name)))
+                .transpose()?;
+            range_bound_builder::<Int32Builder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        DataType::Int64 => {
+            let parsed = bound
+                .map(|text| text.trim().parse::<i64>().map_err(|_| invalid_range_bound(name)))
+                .transpose()?;
+            range_bound_builder::<Int64Builder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        DataType::Decimal128(_, _) => {
+            let parsed = bound.map(decimal_text_to_i128).transpose()?.flatten();
+            range_bound_builder::<Decimal128Builder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            let parsed = bound
+                .map(|text| parse_timestamp_bound(text).ok_or_else(|| invalid_range_bound(name)))
+                .transpose()?;
+            range_bound_builder::<TimestampMicrosecondBuilder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
+            let parsed = bound
+                .map(|text| parse_timestamptz_bound(text).ok_or_else(|| invalid_range_bound(name)))
+                .transpose()?;
+            range_bound_builder::<TimestampMicrosecondBuilder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        DataType::Date32 => {
+            let parsed = bound
+                .map(|text| {
+                    NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d")
+                        .map(|date| date_to_days(&date))
+                        .map_err(|_| invalid_range_bound(name))
+                })
+                .transpose()?;
+            range_bound_builder::<Date32Builder>(builder, field_index, name)?
+                .append_option(parsed);
+        }
+        other => return Err(unsupported_arrow_type(name, other)),
+    }
+    Ok(())
+}
+
+/// Downcasts a struct child builder, erroring instead of panicking on an
+/// internal type mismatch.
+fn range_bound_builder<'a, B: ArrayBuilder>(
+    builder: &'a mut StructBuilder,
+    field_index: usize,
+    name: &str,
+) -> EtlResult<&'a mut B> {
+    builder.field_builder::<B>(field_index).ok_or_else(|| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Arrow staging range builder mismatch",
+            format!("column `{name}` range bound builder does not match its arrow type")
+        )
+    })
+}
+
+/// Parses a Postgres tstzrange bound (e.g. `2026-01-28 01:17:00+00`).
+fn parse_timestamptz_bound(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%#z")
+        .or_else(|_| DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .ok()
+        .map(|dt| dt.timestamp_micros())
+}
+
+/// Parses a Postgres tsrange bound (e.g. `2026-01-28 01:17:00`).
+fn parse_timestamp_bound(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f"))
+        .ok()
+        .map(|dt| dt.and_utc().timestamp_micros())
+}
+
+/// Converts a PgNumeric to a Decimal128(38, 10) mantissa, coercing
+/// NaN/Infinity to NULL — matching the literal path's behavior.
+fn numeric_to_mantissa(numeric: &PgNumeric) -> EtlResult<Option<i128>> {
+    match numeric {
+        PgNumeric::NaN | PgNumeric::PositiveInfinity | PgNumeric::NegativeInfinity => Ok(None),
+        PgNumeric::Value { .. } => decimal_text_to_i128(&numeric.to_string()),
+    }
+}
+
+fn decimal_builder(precision: u8, scale: i8) -> EtlResult<Decimal128Builder> {
+    Decimal128Builder::new().with_precision_and_scale(precision, scale).map_err(|error| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Invalid decimal precision/scale for Arrow staging",
+            error.to_string()
+        )
+    })
+}
+
+fn date_to_days(date: &NaiveDate) -> i32 {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    date.signed_duration_since(epoch).num_days() as i32
+}
+
+fn time_to_micros(time: &NaiveTime) -> i64 {
+    let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+    time.signed_duration_since(midnight).num_microseconds().unwrap_or(0)
+}
+
+fn cell_at<'a>(row: &'a TableRow, index: usize, name: &str) -> EtlResult<&'a Cell> {
+    row.values().get(index).ok_or_else(|| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Row is missing a value for a staged column",
+            format!("column `{name}` has no value at index {index}")
+        )
+    })
+}
+
+fn unexpected_cell(name: &str, cell: &Cell) -> etl::error::EtlError {
+    etl_error!(
+        ErrorKind::ConversionError,
+        "Unexpected cell variant for Arrow staging",
+        format!("column `{name}` received cell variant {}", cell_variant_name(cell))
+    )
+}
+
+fn unexpected_cell_in_array(name: &str, array: &ArrayCell) -> etl::error::EtlError {
+    etl_error!(
+        ErrorKind::ConversionError,
+        "Unexpected cell variant for Arrow staging",
+        format!("column `{name}` received cell variant {}", array_cell_variant_name(array))
+    )
+}
+
+fn invalid_range_bound(name: &str) -> etl::error::EtlError {
+    etl_error!(
+        ErrorKind::ConversionError,
+        "Invalid range bound for Arrow staging",
+        format!("column `{name}` contains a range bound that does not parse as its bound type")
+    )
+}
+
+fn unsupported_arrow_type(name: &str, arrow_type: &DataType) -> etl::error::EtlError {
+    etl_error!(
+        ErrorKind::ConversionError,
+        "Unsupported arrow type for Arrow staging",
+        format!("column `{name}` maps to unsupported arrow type {arrow_type:?}")
+    )
+}
+
+fn cell_variant_name(cell: &Cell) -> &'static str {
+    match cell {
+        Cell::Null => "Null",
+        Cell::Bool(_) => "Bool",
+        Cell::String(_) => "String",
+        Cell::I16(_) => "I16",
+        Cell::I32(_) => "I32",
+        Cell::U32(_) => "U32",
+        Cell::I64(_) => "I64",
+        Cell::F32(_) => "F32",
+        Cell::F64(_) => "F64",
+        Cell::Numeric(_) => "Numeric",
+        Cell::Date(_) => "Date",
+        Cell::Time(_) => "Time",
+        Cell::Timestamp(_) => "Timestamp",
+        Cell::TimestampTz(_) => "TimestampTz",
+        Cell::Uuid(_) => "Uuid",
+        Cell::Json(_) => "Json",
+        Cell::Bytes(_) => "Bytes",
+        Cell::Array(array) => array_cell_variant_name(array),
+    }
+}
+
+fn array_cell_variant_name(array: &ArrayCell) -> &'static str {
+    match array {
+        ArrayCell::Bool(_) => "Array(Bool)",
+        ArrayCell::String(_) => "Array(String)",
+        ArrayCell::I16(_) => "Array(I16)",
+        ArrayCell::I32(_) => "Array(I32)",
+        ArrayCell::U32(_) => "Array(U32)",
+        ArrayCell::I64(_) => "Array(I64)",
+        ArrayCell::F32(_) => "Array(F32)",
+        ArrayCell::F64(_) => "Array(F64)",
+        ArrayCell::Numeric(_) => "Array(Numeric)",
+        ArrayCell::Date(_) => "Array(Date)",
+        ArrayCell::Time(_) => "Array(Time)",
+        ArrayCell::Timestamp(_) => "Array(Timestamp)",
+        ArrayCell::TimestampTz(_) => "Array(TimestampTz)",
+        ArrayCell::Uuid(_) => "Array(Uuid)",
+        ArrayCell::Json(_) => "Array(Json)",
+        ArrayCell::Bytes(_) => "Array(Bytes)",
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use duckdb::arrow::array::{
+        Array, Int32Array, ListArray, StringArray, StructArray, TimestampMicrosecondArray,
+    };
+    use etl::types::{ArrayCell, Cell, ColumnSchema, PgNumeric, TableRow, Type};
+    use std::str::FromStr;
+
+    fn lines_like_schema() -> Vec<ColumnSchema> {
+        vec![
+            ColumnSchema::new("id".into(), Type::UUID, -1, 1, Some(1), false),
+            ColumnSchema::new("debit".into(), Type::NUMERIC, -1, 2, None, true),
+            ColumnSchema::new("tag_ids".into(), Type::UUID_ARRAY, -1, 3, None, true),
+            ColumnSchema::new("effective_range".into(), Type::TSTZ_RANGE_ARRAY, -1, 4, None, true),
+            ColumnSchema::new("created_at".into(), Type::TIMESTAMPTZ, -1, 5, None, true),
+            ColumnSchema::new("description".into(), Type::TEXT, -1, 6, None, true),
+        ]
+    }
+
+    fn sample_rows() -> Vec<TableRow> {
+        vec![
+            TableRow::new(vec![
+                Cell::Uuid(uuid::Uuid::from_str("01234567-89ab-cdef-0123-456789abcdef").unwrap()),
+                Cell::Numeric(PgNumeric::from_str("123.45").unwrap()),
+                Cell::Array(ArrayCell::Uuid(vec![
+                    Some(uuid::Uuid::from_str("11111111-1111-1111-1111-111111111111").unwrap()),
+                    None,
+                ])),
+                Cell::Array(ArrayCell::String(vec![Some(
+                    r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#.to_owned(),
+                )])),
+                Cell::TimestampTz("2026-01-01T00:00:00Z".parse().unwrap()),
+                Cell::String("hello".into()),
+            ]),
+            TableRow::new(vec![
+                Cell::Uuid(uuid::Uuid::nil()),
+                Cell::Numeric(PgNumeric::NaN), // NaN coerces to NULL
+                Cell::Null,
+                Cell::Array(ArrayCell::String(vec![])), // empty range array
+                Cell::Null,
+                Cell::Null,
+            ]),
+        ]
+    }
+
+    /// Stage two lines-shaped rows through a real DuckDB temp table created
+    /// from the spec DDL, then read them back through the cast expressions.
+    #[test]
+    fn record_batch_roundtrip_through_staging_table() {
+        let schemas = lines_like_schema();
+        let specs = build_staging_specs(&schemas).unwrap();
+        let batch: RecordBatch = build_record_batch(&specs, &sample_rows()).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let columns_ddl = specs
+            .iter()
+            .map(|s| format!("{} {}", quote_identifier(&s.name), s.staging_sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Pin the session timezone so TIMESTAMPTZ::VARCHAR is deterministic.
+        conn.execute_batch(&format!(
+            "SET TimeZone = 'UTC'; CREATE TEMP TABLE staging_rt ({columns_ddl});"
+        ))
+        .unwrap();
+        let mut appender = conn.appender("staging_rt").unwrap();
+        appender.append_record_batch(batch).unwrap();
+        appender.flush().unwrap();
+
+        let select_list =
+            specs.iter().map(|s| s.select_expr()).collect::<Vec<_>>().join(", ");
+        let (id, debit, tag_count, lower, desc): (String, Option<String>, i64, String, String) =
+            conn.query_row(
+                &format!(
+                    "SELECT \"id\"::VARCHAR, \"debit\"::VARCHAR, len(\"tag_ids\"),
+                            \"effective_range\"[1].\"lower\"::VARCHAR, \"description\"
+                     FROM (SELECT {select_list} FROM staging_rt) WHERE \"description\" IS NOT NULL"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(debit.as_deref(), Some("123.4500000000"));
+        assert_eq!(tag_count, 2);
+        assert!(lower.starts_with("2026-01-28 01:17:00"), "lower was {lower}");
+        assert_eq!(desc, "hello");
+
+        let (nan_debit, empty_ranges): (Option<String>, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT \"debit\"::VARCHAR, len(\"effective_range\")
+                     FROM (SELECT {select_list} FROM staging_rt) WHERE \"description\" IS NULL"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(nan_debit, None);
+        assert_eq!(empty_ranges, 0);
+    }
+
+    #[test]
+    fn scalar_tstz_range_builds_nullable_structs() {
+        let schemas = vec![ColumnSchema::new("r".into(), Type::TSTZ_RANGE, -1, 1, None, true)];
+        let specs = build_staging_specs(&schemas).unwrap();
+        let rows = vec![
+            TableRow::new(vec![Cell::String(r#"["2026-01-28 01:17:00+00",)"#.to_owned())]),
+            TableRow::new(vec![Cell::String("empty".to_owned())]),
+            TableRow::new(vec![Cell::Null]),
+        ];
+        let batch = build_record_batch(&specs, &rows).unwrap();
+        let ranges = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges.is_valid(0));
+        assert!(ranges.is_null(1)); // empty range -> NULL struct
+        assert!(ranges.is_null(2)); // NULL cell -> NULL struct
+        let lower =
+            ranges.column(0).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let upper =
+            ranges.column(1).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+        let expected: DateTime<Utc> = "2026-01-28T01:17:00Z".parse().unwrap();
+        assert_eq!(lower.value(0), expected.timestamp_micros());
+        assert!(upper.is_null(0)); // unbounded upper -> NULL field
+    }
+
+    #[test]
+    fn int_array_preserves_null_elements() {
+        let schemas = vec![ColumnSchema::new("xs".into(), Type::INT4_ARRAY, -1, 1, None, true)];
+        let specs = build_staging_specs(&schemas).unwrap();
+        let rows = vec![
+            TableRow::new(vec![Cell::Array(ArrayCell::I32(vec![Some(1), None, Some(3)]))]),
+            TableRow::new(vec![Cell::Null]),
+        ];
+        let batch = build_record_batch(&specs, &rows).unwrap();
+        let lists = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(lists.is_valid(0));
+        assert!(lists.is_null(1));
+        let first = lists.value(0);
+        let first = first.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first.value(0), 1);
+        assert!(first.is_null(1));
+        assert_eq!(first.value(2), 3);
+    }
+
+    #[test]
+    fn json_column_serializes_to_text() {
+        let schemas =
+            vec![ColumnSchema::new("payload".into(), Type::JSONB, -1, 1, None, true)];
+        let specs = build_staging_specs(&schemas).unwrap();
+        let rows = vec![
+            TableRow::new(vec![Cell::Json(serde_json::json!({"a": 1}))]),
+            TableRow::new(vec![Cell::Null]),
+        ];
+        let batch = build_record_batch(&specs, &rows).unwrap();
+        let texts = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(texts.value(0), r#"{"a":1}"#);
+        assert!(texts.is_null(1));
+    }
+
+    #[test]
+    fn wrong_cell_variant_names_column_and_variant_only() {
+        let schemas = vec![ColumnSchema::new("debit".into(), Type::NUMERIC, -1, 1, None, true)];
+        let specs = build_staging_specs(&schemas).unwrap();
+        let rows = vec![TableRow::new(vec![Cell::Bool(true)])];
+        let error = build_record_batch(&specs, &rows).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("debit"), "missing column name: {message}");
+        assert!(message.contains("Bool"), "missing variant name: {message}");
+        assert!(!message.contains("true"), "leaked cell value: {message}");
     }
 }
 
