@@ -274,6 +274,97 @@ mod spec_tests {
     }
 }
 
+/// Converts decimal text (PgNumeric's Display output) into an i128 mantissa
+/// at scale 10, rounding the 11th fractional digit half away from zero.
+/// Errors when the value exceeds DECIMAL(38, 10) — matching the literal
+/// path, where DuckDB's CAST would fail the statement.
+pub(super) fn decimal_text_to_i128(text: &str) -> EtlResult<Option<i128>> {
+    const SCALE: usize = 10;
+    // Maximum absolute mantissa for DECIMAL(38, 10): 10^38 - 1
+    const MAX_ABS: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
+
+    let text = text.trim();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int_part, frac_part) = match digits.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (digits, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return Ok(None);
+    }
+    let overflow_err = || {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Numeric value does not fit DECIMAL(38, 10)"
+        )
+    };
+    let mut mantissa: i128 = 0;
+    for ch in int_part.chars() {
+        let d = ch.to_digit(10).ok_or_else(overflow_err)? as i128;
+        mantissa =
+            mantissa.checked_mul(10).and_then(|m| m.checked_add(d)).ok_or_else(overflow_err)?;
+    }
+    let frac_bytes = frac_part.as_bytes();
+    for i in 0..SCALE {
+        let d: i128 = if i < frac_bytes.len() {
+            let b = frac_bytes[i];
+            if b < b'0' || b > b'9' {
+                return Err(overflow_err());
+            }
+            (b - b'0') as i128
+        } else {
+            0
+        };
+        mantissa =
+            mantissa.checked_mul(10).and_then(|m| m.checked_add(d)).ok_or_else(overflow_err)?;
+    }
+    // Round on the 11th fractional digit, half away from zero.
+    if frac_bytes.len() > SCALE {
+        let b = frac_bytes[SCALE];
+        if b < b'0' || b > b'9' {
+            return Err(overflow_err());
+        }
+        let d = b - b'0';
+        if d >= 5 {
+            mantissa = mantissa.checked_add(1).ok_or_else(overflow_err)?;
+        }
+    }
+    if mantissa > MAX_ABS {
+        return Err(overflow_err());
+    }
+    Ok(Some(if negative { -mantissa } else { mantissa }))
+}
+
+#[cfg(test)]
+mod numeric_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_text_to_i128_scale10() {
+        assert_eq!(decimal_text_to_i128("123.45").unwrap(), Some(1_234_500_000_000));
+        assert_eq!(decimal_text_to_i128("-0.0000000001").unwrap(), Some(-1));
+        assert_eq!(decimal_text_to_i128("0").unwrap(), Some(0));
+        // 11th fractional digit rounds half away from zero (DuckDB CAST behavior)
+        assert_eq!(decimal_text_to_i128("0.00000000005").unwrap(), Some(1));
+        assert_eq!(decimal_text_to_i128("-0.00000000005").unwrap(), Some(-1));
+    }
+
+    #[test]
+    fn decimal_text_overflow_errors() {
+        // 29 integer digits + scale 10 > precision 38
+        let too_big = "1".repeat(29);
+        assert!(decimal_text_to_i128(&too_big).is_err());
+    }
+
+    #[test]
+    fn decimal_text_scientific_notation_errors() {
+        assert!(decimal_text_to_i128("1e5").is_err());
+    }
+}
+
 #[cfg(test)]
 mod spike_tests {
     use duckdb::arrow::array::{
