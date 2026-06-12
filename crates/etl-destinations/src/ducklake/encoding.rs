@@ -343,34 +343,65 @@ fn cell_to_sql_literal_typed(cell: &Cell, typ: &Type) -> String {
     cell_to_sql_literal_ref(cell)
 }
 
-/// Parses Postgres range text (e.g. `[2024-01-01,2024-12-31)`) into a DuckDB STRUCT literal.
-fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
+/// A parsed Postgres range: either empty or raw bound strings
+/// (None = unbounded side).
+#[derive(Debug, PartialEq)]
+pub(super) enum ParsedRange {
+    Empty,
+    Bounds(Option<String>, Option<String>),
+}
+
+/// Parses Postgres range text (e.g. `[a,b)`) into raw bound strings.
+pub(super) fn parse_range_text(text: &str) -> ParsedRange {
     let trimmed = text.trim();
     if trimmed == "empty" || trimmed.is_empty() {
-        return "NULL".to_owned();
+        return ParsedRange::Empty;
     }
-
     let inner = &trimmed[1..trimmed.len() - 1];
-    // Postgres quotes range bounds containing spaces (e.g. timestamps):
-    // ["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")
-    // Use quote-aware splitting then strip the surrounding quotes.
-    let (lower, upper) = match split_range_bounds(inner) {
-        Some(parts) => parts,
-        None => return "NULL".to_owned(),
-    };
+    match split_range_bounds(inner) {
+        Some((lower, upper)) => ParsedRange::Bounds(
+            (!lower.is_empty()).then_some(lower),
+            (!upper.is_empty()).then_some(upper),
+        ),
+        None => ParsedRange::Empty,
+    }
+}
 
-    let lower_literal = if lower.is_empty() {
-        "NULL".to_owned()
-    } else {
-        format_typed_literal(&lower, bound_type)
-    };
-    let upper_literal = if upper.is_empty() {
-        "NULL".to_owned()
-    } else {
-        format_typed_literal(&upper, bound_type)
-    };
+/// Parses Postgres range-array text (e.g. `{"[1,2)","[3,4)"}`) into parsed
+/// ranges, unescaping element quoting.
+pub(super) fn parse_range_array_text(text: &str) -> Vec<ParsedRange> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Vec::new();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    split_pg_array_elements(inner)
+        .iter()
+        .map(|elem| {
+            let unquoted = elem.trim_matches('"');
+            let unescaped = unquoted.replace("\\\"", "\"");
+            parse_range_text(&unescaped)
+        })
+        .collect()
+}
 
-    format!("{{'lower': {lower_literal}, 'upper': {upper_literal}}}")
+/// Renders a [`ParsedRange`] as a DuckDB STRUCT literal or NULL.
+fn parsed_range_to_struct_literal(parsed: ParsedRange, bound_type: &str) -> String {
+    match parsed {
+        ParsedRange::Empty => "NULL".to_owned(),
+        ParsedRange::Bounds(lower, upper) => {
+            let lower_literal = lower
+                .map_or_else(|| "NULL".to_owned(), |v| format_typed_literal(&v, bound_type));
+            let upper_literal = upper
+                .map_or_else(|| "NULL".to_owned(), |v| format_typed_literal(&v, bound_type));
+            format!("{{'lower': {lower_literal}, 'upper': {upper_literal}}}")
+        }
+    }
+}
+
+/// Parses Postgres range text (e.g. `[2024-01-01,2024-12-31)`) into a DuckDB STRUCT literal.
+fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
+    parsed_range_to_struct_literal(parse_range_text(text), bound_type)
 }
 
 /// Splits the interior of a Postgres range into (lower, upper) bounds,
@@ -403,22 +434,10 @@ fn split_range_bounds(inner: &str) -> Option<(String, String)> {
 
 /// Parses Postgres range array text (e.g. `{"[1,2)","[3,4)"}`) into a DuckDB list-of-struct literal.
 fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed == "{}" {
-        return "[]".to_owned();
-    }
-
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let elements: Vec<String> = split_pg_array_elements(inner)
-        .iter()
-        .map(|elem| {
-            let unquoted = elem.trim_matches('"');
-            // Postgres escapes quotes inside quoted array elements as \"
-            let unescaped = unquoted.replace("\\\"", "\"");
-            range_text_to_struct_literal(&unescaped, bound_type)
-        })
+    let elements: Vec<String> = parse_range_array_text(text)
+        .into_iter()
+        .map(|p| parsed_range_to_struct_literal(p, bound_type))
         .collect();
-
     format!("[{}]", elements.join(", "))
 }
 
@@ -606,6 +625,32 @@ mod tests {
             }
             PreparedRows::Appender(_) => panic!("expected sql literal fallback"),
         }
+    }
+
+    // --- Typed range parser tests ---
+
+    #[test]
+    fn parse_range_text_returns_raw_bounds() {
+        assert_eq!(
+            parse_range_text("[1,10)"),
+            ParsedRange::Bounds(Some("1".to_owned()), Some("10".to_owned()))
+        );
+        assert_eq!(
+            parse_range_text(r#"["2026-01-28 01:17:00+00",)"#),
+            ParsedRange::Bounds(Some("2026-01-28 01:17:00+00".to_owned()), None)
+        );
+        assert_eq!(parse_range_text("empty"), ParsedRange::Empty);
+        assert_eq!(parse_range_text(""), ParsedRange::Empty);
+    }
+
+    #[test]
+    fn parse_range_array_text_splits_elements() {
+        let elements = parse_range_array_text(r#"{"[1,2)","[3,4)"}"#);
+        assert_eq!(elements.len(), 2);
+        assert_eq!(
+            elements[0],
+            ParsedRange::Bounds(Some("1".to_owned()), Some("2".to_owned()))
+        );
     }
 
     // --- Range conversion tests ---
