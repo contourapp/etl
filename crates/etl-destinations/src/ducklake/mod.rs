@@ -1,3 +1,4 @@
+mod arrow_staging;
 mod batches;
 mod client;
 mod config;
