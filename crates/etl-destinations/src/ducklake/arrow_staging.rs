@@ -24,6 +24,7 @@ use crate::ducklake::encoding::{ParsedRange, parse_range_array_text, parse_range
 use crate::ducklake::sql::quote_identifier;
 
 /// How a staged column reaches its target type in consuming SQL.
+#[derive(Clone)]
 pub(super) enum CastKind {
     /// Staging column already has the target type.
     Identity,
@@ -33,6 +34,7 @@ pub(super) enum CastKind {
 
 /// Per-column staging contract: the Arrow type appended, the staging table
 /// column type, and the cast applied by consuming SQL.
+#[derive(Clone)]
 pub(super) struct StagingColumnSpec {
     pub name: String,
     pub arrow_type: DataType,
@@ -379,9 +381,30 @@ mod numeric_tests {
     }
 }
 
+/// Prepared staging payload reused across retry attempts.
+pub(super) struct PreparedRows {
+    pub batch: RecordBatch,
+}
+
+impl PreparedRows {
+    pub fn row_count(&self) -> usize {
+        self.batch.num_rows()
+    }
+}
+
+/// Converts table rows into the staging payload for DuckDB writes.
+/// Runs on the async worker, off the DuckDB blocking pool.
+pub(super) fn prepare_rows(
+    table_rows: Vec<TableRow>,
+    column_schemas: &[ColumnSchema],
+) -> EtlResult<PreparedRows> {
+    let specs = build_staging_specs(column_schemas)?;
+    let batch = build_record_batch(&specs, &table_rows)?;
+    Ok(PreparedRows { batch })
+}
+
 /// Builds one RecordBatch for the staging table from prepared rows.
 /// Column-oriented: one typed builder per spec, fed from every row.
-#[allow(dead_code)]
 pub(super) fn build_record_batch(
     specs: &[StagingColumnSpec],
     rows: &[TableRow],
