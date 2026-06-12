@@ -63,14 +63,19 @@ use crate::{
 
 /// Maximum number of rows per SQL `INSERT ... VALUES` batch when nested values
 /// force the staging path to bypass DuckDB's appender API.
-const SQL_INSERT_BATCH_SIZE: usize = 128;
+///
+/// Each statement pays a full parse/bind/plan cycle, so larger chunks
+/// directly cut the dominant fixed cost of literal-encoded staging loads.
+const SQL_INSERT_BATCH_SIZE: usize = 1024;
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
 /// Each batch pays at least one target-table scan for its MERGE and delete
-/// statements, so larger batches amortize that scan across far more mutations
-/// while still capping transaction lifetime for DuckLake conflict handling.
-const CDC_MUTATION_BATCH_SIZE: usize = 8192;
+/// statements (random-UUID keys defeat all file pruning), so the cap is set
+/// high enough that a whole pipeline event delivery applies as one scan.
+/// Transaction-lifetime conflicts are no longer a concern: maintenance holds
+/// the write pause and watermark writes are append-only.
+const CDC_MUTATION_BATCH_SIZE: usize = 65_536;
 /// ETL-managed marker table storing per-table applied copy batches.
 const APPLIED_BATCHES_TABLE: &str = "__etl_applied_table_batches";
 /// Inline small marker-table writes in the DuckLake metadata catalog instead of
@@ -2300,6 +2305,19 @@ fn apply_merge_mutation(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // DuckLake rewrites every matched row even when nothing changed
+    // (duckdb/ducklake#462), bloating delete files and new data files, so
+    // only update rows whose non-identity columns actually differ.
+    let change_detection = all_columns
+        .iter()
+        .filter(|c| !identity_columns.contains(c))
+        .map(|c| {
+            let q = quote_identifier(c);
+            format!("target.{q} IS DISTINCT FROM source.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
     let insert_cols = all_columns
         .iter()
         .map(|c| quote_identifier(c))
@@ -2324,7 +2342,7 @@ fn apply_merge_mutation(
             "MERGE INTO {target} AS target \
              USING {deduped_source} AS source \
              ON ({on_clause}) \
-             WHEN MATCHED THEN UPDATE SET {update_set} \
+             WHEN MATCHED AND ({change_detection}) THEN UPDATE SET {update_set} \
              WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
         )
     };
