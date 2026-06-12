@@ -241,6 +241,15 @@ where
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mut retry_attempts: u32 = 0;
 
+        /// A worker attempt that ran at least this long before failing made
+        /// real progress; its failure should not consume the retry budget.
+        /// Without this, recurring transient source errors (e.g. cold WAL
+        /// reads during replication catch-up) accumulate across the worker's
+        /// lifetime and exhaust `table_error_retry_max_attempts` even though
+        /// every attempt advanced the durable flush position.
+        const RETRY_BUDGET_RESET_AFTER: std::time::Duration =
+            std::time::Duration::from_secs(60);
+
         loop {
             let worker = ApplyWorker {
                 pipeline_id,
@@ -255,10 +264,14 @@ where
                 batch_budget: self.batch_budget.clone(),
             };
 
+            let started_at = std::time::Instant::now();
             let result = worker.run_apply_worker().await;
             match result {
                 Ok(()) => return Ok(()),
                 Err(err) => {
+                    if started_at.elapsed() >= RETRY_BUDGET_RESET_AFTER {
+                        retry_attempts = 0;
+                    }
                     let should_shutdown = Self::handle_apply_worker_error(
                         config.as_ref(),
                         &mut shutdown_rx,
