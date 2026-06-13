@@ -1228,6 +1228,232 @@ mod batch_tests {
         assert!(message.contains("Bool"), "missing variant name: {message}");
         assert!(!message.contains("true"), "leaked cell value: {message}");
     }
+
+    /// Builds the staging payload for a single-column schema, creates a real
+    /// DuckDB temp table from the spec DDL, appends the batch, and returns the
+    /// open connection plus the `SELECT` list that applies the read-time casts.
+    /// The session timezone is pinned to UTC so TIMESTAMPTZ rendering is
+    /// deterministic (mirrors `record_batch_roundtrip_through_staging_table`).
+    fn stage_single_column(
+        schema: ColumnSchema,
+        rows: Vec<TableRow>,
+    ) -> (duckdb::Connection, String) {
+        let specs = build_staging_specs(&[schema]).unwrap();
+        let batch = build_record_batch(&specs, &rows).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let columns_ddl = specs
+            .iter()
+            .map(|s| format!("{} {}", quote_identifier(&s.name), s.staging_sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "SET TimeZone = 'UTC'; CREATE TEMP TABLE staging_one ({columns_ddl});"
+        ))
+        .unwrap();
+        let mut appender = conn.appender("staging_one").unwrap();
+        appender.append_record_batch(batch).unwrap();
+        appender.flush().unwrap();
+        drop(appender);
+        let select_list = specs.iter().map(|s| s.select_expr()).collect::<Vec<_>>().join(", ");
+        (conn, select_list)
+    }
+
+    /// Reads `r."lower"::VARCHAR` and `r."upper"::VARCHAR` for the single
+    /// staged scalar-range row, through the cast-applying SELECT.
+    fn read_scalar_bounds(
+        conn: &duckdb::Connection,
+        select_list: &str,
+    ) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            &format!(
+                "SELECT \"r\".\"lower\"::VARCHAR, \"r\".\"upper\"::VARCHAR
+                 FROM (SELECT {select_list} FROM staging_one)"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// Round-trips every scalar range bound type through a real staging table
+    /// and asserts the rendered lower/upper bounds. Exercises the
+    /// `build_range_struct_column` path plus each `append_range_bound` arm.
+    #[test]
+    fn scalar_ranges_roundtrip_all_bound_types() {
+        // int4
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("[1,10)".into())])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert_eq!(lower.as_deref(), Some("1"));
+        assert_eq!(upper.as_deref(), Some("10"));
+
+        // int8
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT8_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("[100,200)".into())])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert_eq!(lower.as_deref(), Some("100"));
+        assert_eq!(upper.as_deref(), Some("200"));
+
+        // numeric — DECIMAL(38,10) renders with trailing zeros to scale 10.
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::NUM_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("[1.50,3.25)".into())])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert_eq!(lower.as_deref(), Some("1.5000000000"));
+        assert_eq!(upper.as_deref(), Some("3.2500000000"));
+
+        // date
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::DATE_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("[2026-01-01,2026-02-01)".into())])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert_eq!(lower.as_deref(), Some("2026-01-01"));
+        assert_eq!(upper.as_deref(), Some("2026-02-01"));
+
+        // ts (no tz)
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::TS_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String(
+                r#"["2026-01-28 01:17:00","2026-01-28 05:25:00")"#.into(),
+            )])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert!(
+            lower.as_deref().unwrap().starts_with("2026-01-28 01:17:00"),
+            "ts lower was {lower:?}"
+        );
+        assert!(
+            upper.as_deref().unwrap().starts_with("2026-01-28 05:25:00"),
+            "ts upper was {upper:?}"
+        );
+
+        // tstz — UTC-pinned session makes the rendering deterministic.
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::TSTZ_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String(
+                r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#.into(),
+            )])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert!(
+            lower.as_deref().unwrap().starts_with("2026-01-28 01:17:00"),
+            "tstz lower was {lower:?}"
+        );
+        assert!(
+            upper.as_deref().unwrap().starts_with("2026-01-28 05:25:00"),
+            "tstz upper was {upper:?}"
+        );
+    }
+
+    /// Round-trips scalar-range edge cases (empty, unbounded side, NULL cell)
+    /// through a real staging table, using int4 as the representative bound.
+    #[test]
+    fn scalar_range_edge_cases_roundtrip() {
+        // empty range -> NULL struct
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("empty".into())])],
+        );
+        let null_count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM (SELECT {sel} FROM staging_one) WHERE \"r\" IS NULL"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 1, "empty range should round-trip as a NULL struct");
+
+        // unbounded upper -> lower=5, upper IS NULL
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String("[5,)".into())])],
+        );
+        let (lower, upper) = read_scalar_bounds(&conn, &sel);
+        assert_eq!(lower.as_deref(), Some("5"));
+        assert_eq!(upper, None, "unbounded upper should be NULL");
+
+        // NULL cell -> NULL struct
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::Null])],
+        );
+        let null_count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM (SELECT {sel} FROM staging_one) WHERE \"r\" IS NULL"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 1, "NULL cell should round-trip as a NULL struct");
+    }
+
+    /// Round-trips a non-tstz range array (int4) through a real staging table,
+    /// covering the whole-array text form, the per-element `ArrayCell::String`
+    /// form (including a NULL element), and the empty-array form. Exercises
+    /// `build_range_list_column`.
+    #[test]
+    fn int4_range_array_roundtrips() {
+        // Whole-array text form: {"[1,2)","[3,4)"}
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE_ARRAY, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::String(r#"{"[1,2)","[3,4)"}"#.into())])],
+        );
+        let (len, e1_lower, e2_upper): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                &format!(
+                    "SELECT len(\"r\"), \"r\"[1].\"lower\"::VARCHAR, \"r\"[2].\"upper\"::VARCHAR
+                     FROM (SELECT {sel} FROM staging_one)"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(e1_lower.as_deref(), Some("1"));
+        assert_eq!(e2_upper.as_deref(), Some("4"));
+
+        // Per-element form with a NULL element -> NULL struct in the list.
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE_ARRAY, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::Array(ArrayCell::String(vec![
+                Some("[1,2)".into()),
+                None,
+            ]))])],
+        );
+        let (len, e1_lower, e2_is_null): (i64, Option<String>, bool) = conn
+            .query_row(
+                &format!(
+                    "SELECT len(\"r\"), \"r\"[1].\"lower\"::VARCHAR, \"r\"[2] IS NULL
+                     FROM (SELECT {sel} FROM staging_one)"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(e1_lower.as_deref(), Some("1"));
+        assert!(e2_is_null, "None element should round-trip as a NULL struct");
+
+        // Empty array -> len 0.
+        let (conn, sel) = stage_single_column(
+            ColumnSchema::new("r".into(), Type::INT4_RANGE_ARRAY, -1, 1, None, true),
+            vec![TableRow::new(vec![Cell::Array(ArrayCell::String(vec![]))])],
+        );
+        let len: i64 = conn
+            .query_row(
+                &format!("SELECT len(\"r\") FROM (SELECT {sel} FROM staging_one)"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(len, 0);
+    }
 }
 
 #[cfg(test)]
