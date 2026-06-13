@@ -107,19 +107,6 @@ fn ducklake_column_definition(column_schema: &ColumnSchema, include_not_null: bo
     format!("{column_name} {duckdb_type}{nullability}")
 }
 
-/// Returns the DuckDB bound type keyword for a Postgres range type.
-pub(super) fn duckdb_range_bound_type(typ: &Type) -> Option<&'static str> {
-    match *typ {
-        Type::INT4_RANGE | Type::INT4_RANGE_ARRAY => Some("integer"),
-        Type::INT8_RANGE | Type::INT8_RANGE_ARRAY => Some("bigint"),
-        Type::NUM_RANGE | Type::NUM_RANGE_ARRAY => Some("DECIMAL(38, 10)"),
-        Type::TS_RANGE | Type::TS_RANGE_ARRAY => Some("timestamp"),
-        Type::TSTZ_RANGE | Type::TSTZ_RANGE_ARRAY => Some("timestamptz"),
-        Type::DATE_RANGE | Type::DATE_RANGE_ARRAY => Some("date"),
-        _ => None,
-    }
-}
-
 /// Builds a `create table if not exists` DDL statement for the given table name
 /// and schema.
 ///
