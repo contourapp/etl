@@ -294,6 +294,11 @@ mod spec_tests {
 /// at scale 10, rounding the 11th fractional digit half away from zero.
 /// Errors when the value exceeds DECIMAL(38, 10) — matching the literal
 /// path, where DuckDB's CAST would fail the statement.
+///
+/// Rounds half-away-from-zero on the 11th fractional digit; assumes
+/// terminating scale-10 inputs (PgNumeric Display output). Differs from
+/// DuckDB CAST only on non-terminating values whose 11th digit is exactly 5
+/// with nonzero trailing digits — not produced by CDC numeric decoding.
 pub(super) fn decimal_text_to_i128(text: &str) -> EtlResult<Option<i128>> {
     const SCALE: usize = 10;
     // Maximum absolute mantissa for DECIMAL(38, 10): 10^38 - 1
@@ -1075,6 +1080,82 @@ mod batch_tests {
             .unwrap();
         assert_eq!(nan_debit, None);
         assert_eq!(empty_ranges, 0);
+    }
+
+    /// Exercises the production dedup SQL shape used by `apply_deduped_upsert`
+    /// / `apply_merge_mutation`: a `QUALIFY ROW_NUMBER() OVER (PARTITION BY
+    /// <identity> ORDER BY rowid DESC) = 1` inner subquery feeding a
+    /// cast-applying outer SELECT. Proves rowid is valid inside the inner
+    /// subquery and that the last-appended row wins, surviving the cast.
+    #[test]
+    fn deduped_insert_keeps_last_appended_per_identity() {
+        // UUID id forces a CAST column in the outer select; INT4 n is identity.
+        let schemas = vec![
+            ColumnSchema::new("id".into(), Type::UUID, -1, 1, Some(1), false),
+            ColumnSchema::new("n".into(), Type::INT4, -1, 2, None, true),
+        ];
+        let specs = build_staging_specs(&schemas).unwrap();
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        // Append order matters: for id_a, n=20 is appended last and must win.
+        let rows = vec![
+            TableRow::new(vec![Cell::String(id_a.to_owned()), Cell::I32(10)]),
+            TableRow::new(vec![Cell::String(id_a.to_owned()), Cell::I32(20)]),
+            TableRow::new(vec![Cell::String(id_b.to_owned()), Cell::I32(30)]),
+        ];
+        let batch = build_record_batch(&specs, &rows).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let staging_ddl = specs
+            .iter()
+            .map(|s| format!("{} {}", quote_identifier(&s.name), s.staging_sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE staging_dedup ({staging_ddl}); \
+             CREATE TEMP TABLE target_dedup (\"id\" UUID, \"n\" INTEGER);"
+        ))
+        .unwrap();
+
+        let mut appender = conn.appender("staging_dedup").unwrap();
+        appender.append_record_batch(batch).unwrap();
+        appender.flush().unwrap();
+        drop(appender);
+
+        let select_exprs =
+            specs.iter().map(|s| s.select_expr()).collect::<Vec<_>>().join(", ");
+        let insert_columns =
+            specs.iter().map(|s| quote_identifier(&s.name)).collect::<Vec<_>>().join(", ");
+        // Mirrors the production dedup INSERT shape exactly.
+        conn.execute_batch(&format!(
+            "INSERT INTO target_dedup ({insert_columns}) \
+             SELECT {select_exprs} FROM (SELECT * FROM staging_dedup \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY \"id\" ORDER BY rowid DESC) = 1)"
+        ))
+        .unwrap();
+
+        let total: i64 =
+            conn.query_row("SELECT COUNT(*) FROM target_dedup", [], |row| row.get(0)).unwrap();
+        assert_eq!(total, 2, "one row per identity after dedup");
+
+        let n_a: i32 = conn
+            .query_row(
+                &format!("SELECT \"n\" FROM target_dedup WHERE \"id\" = '{id_a}'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_a, 20, "last-appended row wins for id_a");
+
+        let n_b: i32 = conn
+            .query_row(
+                &format!("SELECT \"n\" FROM target_dedup WHERE \"id\" = '{id_b}'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_b, 30);
     }
 
     #[test]

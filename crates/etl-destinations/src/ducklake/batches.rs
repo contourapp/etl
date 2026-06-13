@@ -1928,7 +1928,7 @@ impl ReusableStagingTable {
              {staging_table};"
         );
         conn.execute_batch(&sql).map_err(|err| {
-            tracing::error!(error = %err, "error INSERT INTO");
+            tracing::error!(error = %DuckDbSensitiveQueryError, "error INSERT INTO");
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake INSERT SELECT failed",
@@ -1957,7 +1957,7 @@ impl ReusableStagingTable {
         if self.created {
             let sql = format!("truncate table {staging_table};");
             conn.execute_batch(&sql).map_err(|error| {
-                tracing::error!(error = %error, "error clear staging");
+                tracing::error!(error = %DuckDbSensitiveQueryError, "error clear staging");
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
                     "DuckLake staging table clear failed",
@@ -1993,7 +1993,7 @@ impl ReusableStagingTable {
     /// Loads one prepared row payload into the temp staging table.
     fn load_rows(&self, conn: &duckdb::Connection, prepared_rows: &PreparedRows) -> EtlResult<()> {
         let mut appender = conn.appender(&self.staging_name).map_err(|error| {
-            tracing::error!(error = %error, "error appender");
+            tracing::error!(error = %DuckDbSensitiveQueryError, "error appender");
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake staging appender creation failed",
@@ -2257,7 +2257,7 @@ fn apply_deduped_upsert(
     );
 
     conn.execute_batch(&sql).map_err(|err| {
-        tracing::error!(error = %err, "error deduped INSERT");
+        tracing::error!(error = %DuckDbSensitiveQueryError, "error deduped INSERT");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake deduped INSERT failed",
@@ -2363,7 +2363,7 @@ fn apply_merge_mutation(
     };
 
     conn.execute_batch(&sql).map_err(|err| {
-        tracing::error!(error = %err, "error MERGE INTO");
+        tracing::error!(error = %DuckDbSensitiveQueryError, "error MERGE INTO");
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake MERGE INTO failed",

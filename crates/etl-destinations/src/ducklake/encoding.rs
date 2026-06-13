@@ -1,7 +1,5 @@
-use etl::types::{ArrayCell, Cell, TableRow, Type, is_range_array_type, is_range_type};
+use etl::types::{ArrayCell, Cell, TableRow};
 use pg_escape::quote_literal;
-
-use crate::ducklake::schema::duckdb_range_bound_type;
 
 /// Serializes a borrowed row into a SQL `VALUES (...)` tuple.
 pub(super) fn table_row_to_sql_literal_ref(row: &TableRow) -> String {
@@ -204,39 +202,6 @@ fn numeric_to_decimal_literal(n: &etl::types::PgNumeric) -> String {
     }
 }
 
-/// Encodes a cell using column type info for range-aware conversion.
-fn cell_to_sql_literal_typed(cell: &Cell, typ: &Type) -> String {
-    if let Some(bound_type) = duckdb_range_bound_type(typ) {
-        if is_range_type(typ) {
-            return match cell {
-                Cell::Null => "NULL".to_owned(),
-                Cell::String(s) => range_text_to_struct_literal(s, bound_type),
-                other => cell_to_sql_literal_ref(other),
-            };
-        }
-        if is_range_array_type(typ) {
-            return match cell {
-                Cell::Null => "NULL".to_owned(),
-                Cell::String(s) => range_array_text_to_list_literal(s, bound_type),
-                // CDC decodes tstzrange[] as ArrayCell::String where each
-                // element is a single range text like "[lower,upper)".
-                Cell::Array(ArrayCell::String(elements)) => {
-                    let structs: Vec<String> = elements
-                        .iter()
-                        .map(|elem| match elem {
-                            Some(s) => range_text_to_struct_literal(s, bound_type),
-                            None => "NULL".to_owned(),
-                        })
-                        .collect();
-                    format!("[{}]", structs.join(", "))
-                }
-                other => cell_to_sql_literal_ref(other),
-            };
-        }
-    }
-    cell_to_sql_literal_ref(cell)
-}
-
 /// A parsed Postgres range: either empty or raw bound strings
 /// (None = unbounded side).
 #[derive(Debug, PartialEq)]
@@ -279,25 +244,6 @@ pub(super) fn parse_range_array_text(text: &str) -> Vec<ParsedRange> {
         .collect()
 }
 
-/// Renders a [`ParsedRange`] as a DuckDB STRUCT literal or NULL.
-fn parsed_range_to_struct_literal(parsed: ParsedRange, bound_type: &str) -> String {
-    match parsed {
-        ParsedRange::Empty => "NULL".to_owned(),
-        ParsedRange::Bounds(lower, upper) => {
-            let lower_literal = lower
-                .map_or_else(|| "NULL".to_owned(), |v| format_typed_literal(&v, bound_type));
-            let upper_literal = upper
-                .map_or_else(|| "NULL".to_owned(), |v| format_typed_literal(&v, bound_type));
-            format!("{{'lower': {lower_literal}, 'upper': {upper_literal}}}")
-        }
-    }
-}
-
-/// Parses Postgres range text (e.g. `[2024-01-01,2024-12-31)`) into a DuckDB STRUCT literal.
-fn range_text_to_struct_literal(text: &str, bound_type: &str) -> String {
-    parsed_range_to_struct_literal(parse_range_text(text), bound_type)
-}
-
 /// Splits the interior of a Postgres range into (lower, upper) bounds,
 /// handling double-quoted values that may contain commas.
 /// Input example: `"2026-01-28 01:17:00+00","2026-01-28 05:25:00+00"`
@@ -324,15 +270,6 @@ fn split_range_bounds(inner: &str) -> Option<(String, String)> {
             upper.trim_matches('"').to_owned(),
         ))
     }
-}
-
-/// Parses Postgres range array text (e.g. `{"[1,2)","[3,4)"}`) into a DuckDB list-of-struct literal.
-fn range_array_text_to_list_literal(text: &str, bound_type: &str) -> String {
-    let elements: Vec<String> = parse_range_array_text(text)
-        .into_iter()
-        .map(|p| parsed_range_to_struct_literal(p, bound_type))
-        .collect();
-    format!("[{}]", elements.join(", "))
 }
 
 /// Quote-aware comma splitting for Postgres array interior strings.
@@ -444,94 +381,6 @@ mod tests {
             split_range_bounds(",10"),
             Some((String::new(), "10".to_owned()))
         );
-    }
-
-    #[test]
-    fn range_text_to_struct_literal_unquoted_integers() {
-        assert_eq!(
-            range_text_to_struct_literal("[1,10)", "INTEGER"),
-            "{'lower': CAST('1' AS INTEGER), 'upper': CAST('10' AS INTEGER)}"
-        );
-    }
-
-    #[test]
-    fn range_text_to_struct_literal_quoted_timestamps() {
-        assert_eq!(
-            range_text_to_struct_literal(
-                r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#,
-                "TIMESTAMPTZ"
-            ),
-            "{'lower': CAST('2026-01-28 01:17:00+00' AS TIMESTAMPTZ), 'upper': CAST('2026-01-28 05:25:00+00' AS TIMESTAMPTZ)}"
-        );
-    }
-
-    #[test]
-    fn range_text_to_struct_literal_empty() {
-        assert_eq!(range_text_to_struct_literal("empty", "INTEGER"), "NULL");
-    }
-
-    #[test]
-    fn range_text_to_struct_literal_unbounded_upper() {
-        assert_eq!(
-            range_text_to_struct_literal("[1,)", "INTEGER"),
-            "{'lower': CAST('1' AS INTEGER), 'upper': NULL}"
-        );
-    }
-
-    #[test]
-    fn range_array_text_to_list_literal_pg_format() {
-        // Postgres array text: {"[1,2)","[3,4)"}
-        assert_eq!(
-            range_array_text_to_list_literal(r#"{"[1,2)","[3,4)"}"#, "INTEGER"),
-            "[{'lower': CAST('1' AS INTEGER), 'upper': CAST('2' AS INTEGER)}, {'lower': CAST('3' AS INTEGER), 'upper': CAST('4' AS INTEGER)}]"
-        );
-    }
-
-    #[test]
-    fn range_array_text_to_list_literal_pg_quoted_timestamps() {
-        // Postgres array text with quoted range bounds containing spaces:
-        // {"[\"2026-01-28 01:17:00+00\",\"2026-01-28 05:25:00+00\")"}
-        let pg_text = r#"{"[\"2026-01-28 01:17:00+00\",\"2026-01-28 05:25:00+00\")"}"#;
-        let result = range_array_text_to_list_literal(pg_text, "TIMESTAMPTZ");
-        assert_eq!(
-            result,
-            "[{'lower': CAST('2026-01-28 01:17:00+00' AS TIMESTAMPTZ), 'upper': CAST('2026-01-28 05:25:00+00' AS TIMESTAMPTZ)}]"
-        );
-    }
-
-    #[test]
-    fn range_array_text_to_list_literal_empty() {
-        assert_eq!(range_array_text_to_list_literal("{}", "INTEGER"), "[]");
-    }
-
-    #[test]
-    fn cell_to_sql_literal_typed_scalar_range() {
-        let cell = Cell::String("[1,10)".to_owned());
-        assert_eq!(
-            cell_to_sql_literal_typed(&cell, &Type::INT4_RANGE),
-            "{'lower': CAST('1' AS integer), 'upper': CAST('10' AS integer)}"
-        );
-    }
-
-    #[test]
-    fn cell_to_sql_literal_typed_range_array_as_array_cell_string() {
-        // CDC delivers tstzrange[] as ArrayCell::String
-        let cell = Cell::Array(ArrayCell::String(vec![
-            Some(r#"["2026-01-28 01:17:00+00","2026-01-28 05:25:00+00")"#.to_owned()),
-            None,
-        ]));
-        let result = cell_to_sql_literal_typed(&cell, &Type::TSTZ_RANGE_ARRAY);
-        assert_eq!(
-            result,
-            "[{'lower': CAST('2026-01-28 01:17:00+00' AS timestamptz), 'upper': CAST('2026-01-28 05:25:00+00' AS timestamptz)}, NULL]"
-        );
-    }
-
-    #[test]
-    fn cell_to_sql_literal_typed_range_array_empty() {
-        let cell = Cell::Array(ArrayCell::String(vec![]));
-        let result = cell_to_sql_literal_typed(&cell, &Type::TSTZ_RANGE_ARRAY);
-        assert_eq!(result, "[]");
     }
 
 }
