@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
+use chrono::Datelike;
 // Consumed by later tasks (schema column construction, compaction SQL, etc.).
 #[allow(dead_code)]
 use etl::types::{EventSequenceKey, PgLsn};
+use etl::types::{ArrayCell, Cell, ReplicatedTableSchema, TableRow, Type, is_array_type};
 
 /// Column name for the packed CDC version written to every merge-on-read row.
 // Consumed by later tasks (schema column construction, compaction SQL, etc.).
@@ -43,6 +45,120 @@ pub const DEDUP_ORDER_BY: &str = "_etl_version DESC, _etl_deleted ASC";
 #[allow(dead_code)]
 pub fn version_u128(commit_lsn: PgLsn, tx_ordinal: u64) -> u128 {
     EventSequenceKey::new(commit_lsn, tx_ordinal).as_u128()
+}
+
+/// Returns `true` if an update moved the row to a different `(year, month)` partition
+/// of the `effective_at_local` column (identified by `eff_idx`).
+///
+/// Conservatively returns `true` when either value is missing or NULL so a stale
+/// row is never stranded in the wrong partition.
+// Consumed by Task 6.
+#[allow(dead_code)]
+pub fn is_partition_move(old: &TableRow, new: &TableRow, eff_idx: usize) -> bool {
+    match (eff_ym(old, eff_idx), eff_ym(new, eff_idx)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    }
+}
+
+/// Extracts `(year, month)` from the `effective_at_local` cell at `i`, or
+/// `None` if the cell is absent or not a timestamptz.
+fn eff_ym(row: &TableRow, i: usize) -> Option<(i32, u32)> {
+    match row.values().get(i) {
+        Some(Cell::TimestampTz(ts)) => Some((ts.year(), ts.month())),
+        _ => None,
+    }
+}
+
+/// Returns a tombstone image for a deleted or partition-moved row.
+///
+/// The tombstone is the old row image itself so it carries the old partition key.
+/// `_etl_deleted` is applied later at encode time, not here.
+// Consumed by Task 6.
+#[allow(dead_code)]
+pub fn build_tombstone_image(old: TableRow) -> TableRow {
+    old
+}
+
+/// Expands a PK-only key row to full column width for unpartitioned
+/// merge-on-read tables.
+///
+/// PK columns keep their real values. Non-PK columns get `Cell::Null` if
+/// nullable, or a type-appropriate zero value if non-nullable (since the
+/// appender must write a well-formed row for every column). Array types always
+/// use an empty array regardless of nullability, mirroring the ClickHouse
+/// `expand_key_row` logic in `crates/etl-destinations/src/clickhouse/core.rs`.
+// Consumed by Task 6.
+#[allow(dead_code)]
+pub fn expand_key_row(key_row: TableRow, schema: &ReplicatedTableSchema) -> TableRow {
+    let key_cells = key_row.into_values();
+    let mut key_iter = key_cells.into_iter();
+    let cells: Vec<Cell> = schema
+        .column_schemas()
+        .map(|col| {
+            if col.primary_key_ordinal_position.is_some() {
+                key_iter.next().unwrap_or(Cell::Null)
+            } else if col.nullable && !is_array_type(&col.typ) {
+                Cell::Null
+            } else {
+                default_cell(&col.typ)
+            }
+        })
+        .collect();
+    TableRow::new(cells)
+}
+
+/// Returns a zero-value `Cell` for a Postgres type, mirroring the ClickHouse
+/// `default_cell` helper. Array types produce empty arrays. All other
+/// non-primitive types fall back to an empty `String`.
+fn default_cell(typ: &Type) -> Cell {
+    match *typ {
+        Type::BOOL => Cell::Bool(false),
+        Type::INT2 => Cell::I16(0),
+        Type::INT4 => Cell::I32(0),
+        Type::INT8 => Cell::I64(0),
+        Type::OID => Cell::U32(0),
+        Type::FLOAT4 => Cell::F32(0.0),
+        Type::FLOAT8 => Cell::F64(0.0),
+        Type::DATE => Cell::Date(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+        Type::TIMESTAMP => Cell::Timestamp(chrono::DateTime::UNIX_EPOCH.naive_utc()),
+        Type::TIMESTAMPTZ => Cell::TimestampTz(chrono::DateTime::UNIX_EPOCH),
+        Type::UUID => Cell::Uuid(uuid::Uuid::nil()),
+        Type::CHAR
+        | Type::BPCHAR
+        | Type::VARCHAR
+        | Type::NAME
+        | Type::TEXT
+        | Type::NUMERIC
+        | Type::MONEY
+        | Type::TIME
+        | Type::JSON
+        | Type::JSONB
+        | Type::BYTEA => Cell::String(String::new()),
+        Type::BOOL_ARRAY => Cell::Array(ArrayCell::Bool(Vec::new())),
+        Type::INT2_ARRAY => Cell::Array(ArrayCell::I16(Vec::new())),
+        Type::INT4_ARRAY => Cell::Array(ArrayCell::I32(Vec::new())),
+        Type::INT8_ARRAY => Cell::Array(ArrayCell::I64(Vec::new())),
+        Type::OID_ARRAY => Cell::Array(ArrayCell::U32(Vec::new())),
+        Type::FLOAT4_ARRAY => Cell::Array(ArrayCell::F32(Vec::new())),
+        Type::FLOAT8_ARRAY => Cell::Array(ArrayCell::F64(Vec::new())),
+        Type::TEXT_ARRAY
+        | Type::VARCHAR_ARRAY
+        | Type::CHAR_ARRAY
+        | Type::BPCHAR_ARRAY
+        | Type::NAME_ARRAY
+        | Type::MONEY_ARRAY => Cell::Array(ArrayCell::String(Vec::new())),
+        Type::NUMERIC_ARRAY => Cell::Array(ArrayCell::Numeric(Vec::new())),
+        Type::DATE_ARRAY => Cell::Array(ArrayCell::Date(Vec::new())),
+        Type::TIME_ARRAY => Cell::Array(ArrayCell::Time(Vec::new())),
+        Type::TIMESTAMP_ARRAY => Cell::Array(ArrayCell::Timestamp(Vec::new())),
+        Type::TIMESTAMPTZ_ARRAY => Cell::Array(ArrayCell::TimestampTz(Vec::new())),
+        Type::UUID_ARRAY => Cell::Array(ArrayCell::Uuid(Vec::new())),
+        Type::JSON_ARRAY | Type::JSONB_ARRAY => Cell::Array(ArrayCell::Json(Vec::new())),
+        Type::BYTEA_ARRAY => Cell::Array(ArrayCell::Bytes(Vec::new())),
+        _ if is_array_type(typ) => Cell::Array(ArrayCell::String(Vec::new())),
+        _ => Cell::String(String::new()),
+    }
 }
 
 /// Predicate that identifies which tables use merge-on-read CDC semantics and
@@ -103,6 +219,108 @@ mod tests {
         assert!(!s.contains("public_dimension__values"));
         assert!(s.is_partitioned("public_lines"));
         assert!(!s.is_partitioned("public_observations"));
+    }
+}
+
+#[cfg(test)]
+mod partition_move_tests {
+    use std::sync::Arc;
+
+    use chrono::DateTime;
+    use etl::types::{
+        Cell, ColumnSchema, TableId, TableName, TableRow, TableSchema, Type,
+        ReplicatedTableSchema,
+    };
+    use tokio_postgres::types::Oid;
+
+    use super::{build_tombstone_image, default_cell, expand_key_row, is_partition_move};
+
+    /// Index of the `effective_at_local` cell within `row_eff`.
+    fn eff_idx() -> usize {
+        0
+    }
+
+    /// Builds a `TableRow` whose only cell is a `TimestampTz` parsed from an
+    /// RFC 3339 string. `eff_idx()` identifies that cell.
+    fn row_eff(ts_str: &str) -> TableRow {
+        let ts: DateTime<chrono::Utc> = ts_str.parse().expect("valid RFC 3339 timestamp");
+        TableRow::new(vec![Cell::TimestampTz(ts)])
+    }
+
+    /// Reads the `effective_at_local` cell back from a row.
+    fn cell_eff(row: &TableRow) -> &Cell {
+        &row.values()[eff_idx()]
+    }
+
+    /// Builds a 3-column `ReplicatedTableSchema`:
+    ///   col 0: `id` INT4 PK not-null
+    ///   col 1: `label` TEXT nullable
+    ///   col 2: `score` INT4 not-null (non-nullable, non-PK)
+    fn three_col_schema() -> ReplicatedTableSchema {
+        let table_schema = TableSchema::new(
+            TableId::new(Oid::from(1u32)),
+            TableName::new("public".to_owned(), "test_table".to_owned()),
+            vec![
+                ColumnSchema::new("id".to_owned(), Type::INT4, -1, 1, Some(1), false),
+                ColumnSchema::new("label".to_owned(), Type::TEXT, -1, 2, None, true),
+                ColumnSchema::new("score".to_owned(), Type::INT4, -1, 3, None, false),
+            ],
+        );
+        ReplicatedTableSchema::all(Arc::new(table_schema))
+    }
+
+    #[test]
+    fn move_on_month_change() {
+        assert!(is_partition_move(
+            &row_eff("2026-03-15T00:00:00Z"),
+            &row_eff("2026-07-02T00:00:00Z"),
+            eff_idx()
+        ));
+    }
+
+    #[test]
+    fn no_move_same_month() {
+        assert!(!is_partition_move(
+            &row_eff("2026-03-01T00:00:00Z"),
+            &row_eff("2026-03-28T00:00:00Z"),
+            eff_idx()
+        ));
+    }
+
+    #[test]
+    fn tombstone_keeps_old_partition_key() {
+        let old = row_eff("2026-03-15T00:00:00Z");
+        let old_copy = old.clone();
+        let tombstone = build_tombstone_image(old);
+        assert_eq!(cell_eff(&tombstone), cell_eff(&old_copy));
+    }
+
+    #[test]
+    fn missing_cell_is_conservative_move() {
+        // If eff_idx is out of bounds, treat as a partition move.
+        let row = TableRow::new(vec![Cell::Null]);
+        assert!(is_partition_move(&row, &row_eff("2026-03-15T00:00:00Z"), 99));
+    }
+
+    #[test]
+    fn null_cell_is_conservative_move() {
+        let row = TableRow::new(vec![Cell::Null]);
+        assert!(is_partition_move(&row, &row_eff("2026-03-15T00:00:00Z"), eff_idx()));
+    }
+
+    #[test]
+    fn expand_key_row_fills_non_pk_columns() {
+        let schema = three_col_schema();
+        // Key row has only the PK value (id = 42).
+        let key_row = TableRow::new(vec![Cell::I32(42)]);
+        let expanded = expand_key_row(key_row, &schema);
+        let vals = expanded.values();
+        // col 0: PK kept
+        assert_eq!(vals[0], Cell::I32(42));
+        // col 1: nullable TEXT -> Null
+        assert_eq!(vals[1], Cell::Null);
+        // col 2: non-nullable INT4 -> zero
+        assert_eq!(vals[2], default_cell(&Type::INT4));
     }
 }
 

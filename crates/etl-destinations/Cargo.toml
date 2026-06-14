@@ -31,6 +31,7 @@ ducklake = [
     "dep:tracing",
     "dep:tokio",
     "dep:url",
+    "dep:uuid",
 ]
 bigquery = [
     "dep:gcp-bigquery-client",
