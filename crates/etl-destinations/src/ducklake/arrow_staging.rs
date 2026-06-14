@@ -445,8 +445,6 @@ pub(super) fn build_record_batch(
 /// Extends a base set of staging specs with two trailing CDC columns:
 /// `_etl_version` (packed u128 version, carried as Decimal128(38,0) and cast
 /// to UHUGEINT at read time) and `_etl_deleted` (boolean tombstone flag).
-// Consumed by Task 6.
-#[allow(dead_code)]
 pub(super) fn build_staging_specs_with_cdc(
     column_schemas: &[ColumnSchema],
 ) -> EtlResult<Vec<StagingColumnSpec>> {
@@ -465,6 +463,23 @@ pub(super) fn build_staging_specs_with_cdc(
         cast: CastKind::Identity,
     });
     Ok(specs)
+}
+
+/// Builds a [`PreparedRows`] payload carrying the two trailing CDC columns.
+///
+/// `specs` must be CDC-augmented (i.e. produced by
+/// [`build_staging_specs_with_cdc`]) so its trailing two columns are
+/// `_etl_version` / `_etl_deleted`. Every row in the resulting batch carries the
+/// same constant `version` and `deleted` flag. This mirrors [`prepare_rows`]
+/// but for the merge-on-read append path.
+pub(super) fn prepare_rows_with_cdc(
+    table_rows: Vec<TableRow>,
+    specs: &[StagingColumnSpec],
+    version: u128,
+    deleted: bool,
+) -> EtlResult<PreparedRows> {
+    let batch = build_record_batch_with_cdc(&table_rows, specs, version, deleted)?;
+    Ok(PreparedRows { batch })
 }
 
 /// Builds a RecordBatch with CDC-augmented specs: user columns are built

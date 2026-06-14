@@ -11,6 +11,11 @@ use etl::types::{ArrayCell, Cell, ReplicatedTableSchema, TableRow, Type, is_arra
 #[allow(dead_code)]
 pub const ETL_VERSION_COLUMN: &str = "_etl_version";
 
+/// Partition-key column on the partitioned in-scope fact tables
+/// (`public_lines`, `public_measurements`). Its `(year, month)` determines a
+/// row's partition, so a change to it across an update is a partition move.
+pub const EFFECTIVE_AT_LOCAL_COLUMN: &str = "effective_at_local";
+
 /// Column name for the boolean tombstone flag written on DELETE rows.
 // Consumed by later tasks (schema column construction, compaction SQL, etc.).
 #[allow(dead_code)]
@@ -52,8 +57,6 @@ pub fn version_u128(commit_lsn: PgLsn, tx_ordinal: u64) -> u128 {
 ///
 /// Conservatively returns `true` when either value is missing or NULL so a stale
 /// row is never stranded in the wrong partition.
-// Consumed by Task 6.
-#[allow(dead_code)]
 pub fn is_partition_move(old: &TableRow, new: &TableRow, eff_idx: usize) -> bool {
     match (eff_ym(old, eff_idx), eff_ym(new, eff_idx)) {
         (Some(a), Some(b)) => a != b,
@@ -74,8 +77,6 @@ fn eff_ym(row: &TableRow, i: usize) -> Option<(i32, u32)> {
 ///
 /// The tombstone is the old row image itself so it carries the old partition key.
 /// `_etl_deleted` is applied later at encode time, not here.
-// Consumed by Task 6.
-#[allow(dead_code)]
 pub fn build_tombstone_image(old: TableRow) -> TableRow {
     old
 }
@@ -88,8 +89,6 @@ pub fn build_tombstone_image(old: TableRow) -> TableRow {
 /// appender must write a well-formed row for every column). Array types always
 /// use an empty array regardless of nullability, mirroring the ClickHouse
 /// `expand_key_row` logic in `crates/etl-destinations/src/clickhouse/core.rs`.
-// Consumed by Task 6.
-#[allow(dead_code)]
 pub fn expand_key_row(key_row: TableRow, schema: &ReplicatedTableSchema) -> TableRow {
     let key_cells = key_row.into_values();
     let mut key_iter = key_cells.into_iter();

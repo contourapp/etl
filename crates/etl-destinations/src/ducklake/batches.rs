@@ -41,7 +41,8 @@ use crate::{
     ducklake::{
         DuckLakeTableName, LAKE_CATALOG,
         arrow_staging::{
-            CastKind, PreparedRows, StagingColumnSpec, build_staging_specs, prepare_rows,
+            CastKind, PreparedRows, StagingColumnSpec, build_staging_specs,
+            build_staging_specs_with_cdc, prepare_rows, prepare_rows_with_cdc,
         },
         client::{
             DuckLakeBlockingOperationContext, DuckLakeConnectionManager, format_query_error_detail,
@@ -56,6 +57,10 @@ use crate::{
             ETL_DUCKLAKE_FAILED_BATCHES_TOTAL, ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL,
             ETL_DUCKLAKE_RETRIES_TOTAL, ETL_DUCKLAKE_UPSERT_ROWS, PREPARED_ROWS_KIND_LABEL,
             RETRY_SCOPE_LABEL, SUB_BATCH_KIND_LABEL,
+        },
+        merge_on_read::{
+            EFFECTIVE_AT_LOCAL_COLUMN, MergeOnReadScope, build_tombstone_image, expand_key_row,
+            is_partition_move, version_u128,
         },
         sql::{qualified_lake_table_name, quote_identifier},
     },
@@ -184,6 +189,16 @@ enum PreparedTableMutation {
     DedupedUpsert {
         rows: PreparedRows,
         identity_columns: Vec<String>,
+    },
+    /// Merge-on-read append: plain INSERT of CDC-annotated rows (carrying
+    /// `_etl_version` / `_etl_deleted`) with no dedup and no target scan.
+    ///
+    /// Unlike [`PreparedTableMutation::DedupedUpsert`], appends must *not*
+    /// collapse by identity: a partition move appends both a tombstone (old
+    /// partition) and a live image (new partition) for the same `id` at the
+    /// same version, and both rows must survive.
+    Append {
+        rows: PreparedRows,
     },
     /// MERGE INTO: hash-join against target for Replace/Update mutations.
     Merge {
@@ -656,6 +671,7 @@ pub(super) fn prepare_mutation_table_batches(
     replicated_table_schema: &ReplicatedTableSchema,
     table_name: DuckLakeTableName,
     tracked_mutations: Vec<TrackedTableMutation>,
+    scope: &MergeOnReadScope,
 ) -> EtlResult<Vec<PreparedDuckLakeTableBatch>> {
     let mut prepared_batches = Vec::new();
     let mut pending_mutations = Vec::new();
@@ -668,6 +684,7 @@ pub(super) fn prepare_mutation_table_batches(
                 replicated_table_schema,
                 &table_name,
                 std::mem::take(&mut pending_mutations),
+                scope,
             )?;
         }
     }
@@ -677,6 +694,7 @@ pub(super) fn prepare_mutation_table_batches(
         replicated_table_schema,
         &table_name,
         pending_mutations,
+        scope,
     )?;
 
     Ok(prepared_batches)
@@ -1074,6 +1092,7 @@ fn push_prepared_mutation_batch(
     replicated_table_schema: &ReplicatedTableSchema,
     table_name: &str,
     tracked_mutations: Vec<TrackedTableMutation>,
+    scope: &MergeOnReadScope,
 ) -> EtlResult<()> {
     if tracked_mutations.is_empty() {
         return Ok(());
@@ -1083,8 +1102,28 @@ fn push_prepared_mutation_batch(
         build_mutation_batch_identity(table_name, replicated_table_schema, &tracked_mutations)?;
     let first_sequence_key = tracked_mutations.first().map(TrackedTableMutation::sequence_key);
     let last_sequence_key = tracked_mutations.last().map(TrackedTableMutation::sequence_key);
-    let mutations = tracked_mutations.into_iter().map(|tracked| tracked.mutation).collect();
     let column_schemas: Vec<_> = replicated_table_schema.column_schemas().cloned().collect();
+
+    let (staging_specs, action) = if scope.contains(table_name) {
+        // Merge-on-read: every mutation becomes a CDC-annotated append. The
+        // staging table (and therefore the batch's RecordBatches) carry the two
+        // trailing `_etl_version` / `_etl_deleted` columns.
+        let staging_specs = build_staging_specs_with_cdc(&column_schemas)?;
+        let action = PreparedDuckLakeTableBatchAction::Mutation(prepare_append_mutations(
+            replicated_table_schema,
+            tracked_mutations,
+            scope.is_partitioned(table_name),
+            &staging_specs,
+        )?);
+        (staging_specs, action)
+    } else {
+        let mutations = tracked_mutations.into_iter().map(|tracked| tracked.mutation).collect();
+        let action = PreparedDuckLakeTableBatchAction::Mutation(prepare_table_mutations(
+            replicated_table_schema,
+            mutations,
+        )?);
+        (build_staging_specs(&column_schemas)?, action)
+    };
 
     prepared_batches.push(PreparedDuckLakeTableBatch {
         table_name: table_name.to_owned(),
@@ -1094,11 +1133,8 @@ fn push_prepared_mutation_batch(
         last_commit_lsn: identity.last_commit_lsn,
         first_sequence_key,
         last_sequence_key,
-        staging_specs: build_staging_specs(&column_schemas)?,
-        action: PreparedDuckLakeTableBatchAction::Mutation(prepare_table_mutations(
-            replicated_table_schema,
-            mutations,
-        )?),
+        staging_specs,
+        action,
     });
 
     Ok(())
@@ -1324,6 +1360,198 @@ fn prepare_table_mutations(
     flush_deletes!(prepared_mutations, delete_key_rows, &identity_column_schemas);
 
     Ok(prepared_mutations)
+}
+
+/// Groups ordered row mutations into append-only DuckDB operations for
+/// merge-on-read tables.
+///
+/// Every source mutation becomes one or more plain INSERTs of CDC-annotated
+/// rows (carrying `_etl_version` / `_etl_deleted`); no statement references the
+/// target for matching, so the per-mutation full-table scan disappears.
+///
+/// - Insert / Replace -> one append of the new image (`deleted=false`).
+/// - Update (same partition) -> one append of the new image (`deleted=false`).
+/// - Update (partition move) -> a tombstone append in the old partition
+///   (`deleted=true`) plus the new image in the new partition (`deleted=false`),
+///   both at the same version.
+/// - Delete -> one tombstone append (`deleted=true`).
+///
+/// `staging_specs` must be the CDC-augmented specs whose trailing two columns
+/// are `_etl_version` / `_etl_deleted`; the produced batches match them so the
+/// shared staging table's DDL and INSERT column list line up.
+fn prepare_append_mutations(
+    replicated_table_schema: &ReplicatedTableSchema,
+    tracked_mutations: Vec<TrackedTableMutation>,
+    partitioned: bool,
+    staging_specs: &[StagingColumnSpec],
+) -> EtlResult<Vec<PreparedTableMutation>> {
+    let column_schemas: Vec<_> = replicated_table_schema.column_schemas().cloned().collect();
+    let eff_idx = column_schemas
+        .iter()
+        .position(|c| c.name == EFFECTIVE_AT_LOCAL_COLUMN);
+
+    let mut prepared_mutations = Vec::new();
+
+    // Emits one append (plain INSERT, no dedup) for one CDC image.
+    macro_rules! push_append {
+        ($rows:expr, $version:expr, $deleted:expr) => {
+            prepared_mutations.push(PreparedTableMutation::Append {
+                rows: prepare_rows_with_cdc($rows, staging_specs, $version, $deleted)?,
+            });
+        };
+    }
+
+    for tracked in tracked_mutations {
+        let version = version_u128(tracked.commit_lsn, tracked.tx_ordinal);
+        match tracked.mutation {
+            TableMutation::Insert(row) | TableMutation::Replace(row) => {
+                push_append!(vec![row], version, false);
+            }
+            TableMutation::Delete(delete_row) => {
+                if partitioned {
+                    let old_full = delete_row.into_full().ok_or_else(|| {
+                        append_requires_full_old_row(replicated_table_schema, "delete")
+                    })?;
+                    push_append!(vec![build_tombstone_image(old_full)], version, true);
+                } else {
+                    let key_row = delete_row.into_key().ok_or_else(|| {
+                        // A partitioned-table delete would carry a Full row; an
+                        // unpartitioned-table delete carries the key row. A Full
+                        // image here is unexpected for an unpartitioned table.
+                        etl_error!(
+                            ErrorKind::InvalidState,
+                            "DuckLake merge-on-read delete on unpartitioned table missing key row",
+                            format!("table '{}'", replicated_table_schema.name())
+                        )
+                    })?;
+                    let tombstone = expand_key_row(key_row, replicated_table_schema);
+                    push_append!(vec![tombstone], version, true);
+                }
+            }
+            TableMutation::Update { delete_row, new_row } => {
+                // Reconstruct the complete new image. Under REPLICA IDENTITY
+                // FULL a Partial new row (unchanged-TOAST) is recoverable by
+                // overlaying its changed columns onto the full old row.
+                let new_full = reconstruct_full_new_row(
+                    replicated_table_schema,
+                    &delete_row,
+                    new_row,
+                    &column_schemas,
+                )?;
+
+                if partitioned {
+                    let eff_idx = eff_idx.ok_or_else(|| {
+                        etl_error!(
+                            ErrorKind::InvalidState,
+                            "DuckLake merge-on-read partitioned table missing effective_at_local",
+                            format!("table '{}'", replicated_table_schema.name())
+                        )
+                    })?;
+                    let old_full = delete_row.into_full().ok_or_else(|| {
+                        // Task 19 adds the key-only backlog fallback.
+                        append_requires_full_old_row(replicated_table_schema, "update")
+                    })?;
+                    // Borrow-based move check BEFORE moving old_full into the
+                    // tombstone image.
+                    let moved = is_partition_move(&old_full, &new_full, eff_idx);
+                    if moved {
+                        push_append!(vec![build_tombstone_image(old_full)], version, true);
+                    }
+                    push_append!(vec![new_full], version, false);
+                } else {
+                    push_append!(vec![new_full], version, false);
+                }
+            }
+        }
+    }
+
+    Ok(prepared_mutations)
+}
+
+/// Reconstructs the complete new row image for a merge-on-read update.
+///
+/// A `Full` new row is used directly. A `Partial` new row (unchanged-TOAST under
+/// REPLICA IDENTITY FULL) is rebuilt by overlaying its present columns onto the
+/// full old row: missing replicated-column positions take the old row's value,
+/// the rest take the partial's present values in order. If the old row is not a
+/// full image, reconstruction is impossible and an error is returned (Task 19
+/// adds the key-only / read-before-write fallback).
+fn reconstruct_full_new_row(
+    replicated_table_schema: &ReplicatedTableSchema,
+    delete_row: &OldTableRow,
+    new_row: UpdatedTableRow,
+    column_schemas: &[ColumnSchema],
+) -> EtlResult<TableRow> {
+    match new_row {
+        UpdatedTableRow::Full(row) => Ok(row),
+        UpdatedTableRow::Partial(partial) => {
+            let old_full = delete_row.as_full().ok_or_else(|| {
+                append_requires_full_old_row(replicated_table_schema, "update")
+            })?;
+            overlay_partial_on_full(partial, old_full, column_schemas.len(), replicated_table_schema)
+        }
+    }
+}
+
+/// Overlays a partial new row's present columns onto a full old row, yielding a
+/// complete new image in replicated table-column order.
+fn overlay_partial_on_full(
+    partial: PartialTableRow,
+    old_full: &TableRow,
+    total_columns: usize,
+    replicated_table_schema: &ReplicatedTableSchema,
+) -> EtlResult<TableRow> {
+    if old_full.values().len() != total_columns {
+        return Err(etl_error!(
+            ErrorKind::InvalidState,
+            "DuckLake merge-on-read old row shape does not match schema",
+            format!(
+                "expected {} values for table '{}', got {}",
+                total_columns,
+                replicated_table_schema.name(),
+                old_full.values().len()
+            )
+        ));
+    }
+    let (present, missing_indexes) = partial.into_parts();
+    let missing: std::collections::HashSet<usize> = missing_indexes.into_iter().collect();
+    let mut present_iter = present.into_values().into_iter();
+    let mut cells = Vec::with_capacity(total_columns);
+    for index in 0..total_columns {
+        if missing.contains(&index) {
+            cells.push(old_full.values()[index].clone());
+        } else {
+            let cell = present_iter.next().ok_or_else(|| {
+                etl_error!(
+                    ErrorKind::InvalidState,
+                    "DuckLake merge-on-read partial row missing a present value",
+                    format!(
+                        "table '{}' partial row ran out of present values at column {index}",
+                        replicated_table_schema.name()
+                    )
+                )
+            })?;
+            cells.push(cell);
+        }
+    }
+    Ok(TableRow::new(cells))
+}
+
+/// Builds the error returned when an append-only mutation needs the full old
+/// row image but only a key-only image is available (pre-cutover backlog).
+fn append_requires_full_old_row(
+    replicated_table_schema: &ReplicatedTableSchema,
+    origin: &str,
+) -> etl::error::EtlError {
+    etl_error!(
+        ErrorKind::SourceReplicaIdentityError,
+        "DuckLake merge-on-read append requires a full old row image",
+        format!(
+            "table '{}' {origin} carried a key-only old row; REPLICA IDENTITY FULL is required \
+             (key-only backlog fallback is deferred to a later task)",
+            replicated_table_schema.name()
+        )
+    )
 }
 
 /// Returns whether an update's old replica-identity values equal the new
@@ -2196,6 +2424,15 @@ fn apply_table_mutation(
             .record(rows.row_count() as f64);
             apply_deduped_upsert(conn, rows, reusable_staging_table, identity_columns)
         }
+        PreparedTableMutation::Append { rows } => {
+            histogram!(
+                ETL_DUCKLAKE_UPSERT_ROWS,
+                BATCH_KIND_LABEL => batch.batch_kind.as_str(),
+                PREPARED_ROWS_KIND_LABEL => PREPARED_ROWS_KIND,
+            )
+            .record(rows.row_count() as f64);
+            apply_upsert_mutation(conn, rows, reusable_staging_table)
+        }
         PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
             histogram!(
                 ETL_DUCKLAKE_UPSERT_ROWS,
@@ -2518,7 +2755,8 @@ fn apply_sub_batch_rows(batch: &PreparedDuckLakeTableBatch) -> Option<usize> {
 
     match &prepared_mutations[0] {
         PreparedTableMutation::Upsert(prepared_rows) => Some(prepared_rows.row_count()),
-        PreparedTableMutation::DedupedUpsert { rows, .. }
+        PreparedTableMutation::Append { rows }
+        | PreparedTableMutation::DedupedUpsert { rows, .. }
         | PreparedTableMutation::Merge { rows, .. } => Some(rows.row_count()),
         PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => None,
     }
@@ -3014,6 +3252,7 @@ mod tests {
                     ])),
                 ),
             ],
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3068,6 +3307,7 @@ mod tests {
                     ])),
                 ),
             ],
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3116,6 +3356,7 @@ mod tests {
                     ]))),
                 ),
             ],
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3175,6 +3416,7 @@ mod tests {
                     },
                 ),
             ],
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3216,6 +3458,7 @@ mod tests {
             &replicated_table_schema,
             "public_users".to_owned(),
             tracked,
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3283,6 +3526,7 @@ mod tests {
                     ])),
                 ),
             ],
+            &MergeOnReadScope::default(),
         )
         .unwrap();
 
@@ -3480,5 +3724,404 @@ mod tests {
         );
 
         assert_ne!(first.batch_id, second.batch_id);
+    }
+}
+
+/// Merge-on-read append routing tests.
+///
+/// These exercise [`prepare_append_mutations`] both at the shape level (how many
+/// appends, which `_etl_version` / `_etl_deleted` each carries) and end-to-end
+/// against a real in-memory DuckDB table whose DDL carries the two CDC columns.
+/// The end-to-end half stages every produced `RecordBatch` and runs the same
+/// plain INSERT the apply path runs, then resolves current state with the
+/// production `ROW_NUMBER` dedup query — proving the routed batches line up with
+/// the CDC staging contract and dedup correctly.
+#[cfg(test)]
+mod merge_on_read_apply_tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use chrono::{DateTime, Utc};
+    use duckdb::Connection;
+    use duckdb::arrow::array::{Array, BooleanArray, Decimal128Array, Int32Array};
+    use etl::types::{
+        Cell, ColumnSchema, PartialTableRow, PgLsn, ReplicatedTableSchema, TableId, TableName,
+        TableRow, TableSchema, Type as PgType, UpdatedTableRow,
+    };
+
+    use super::*;
+
+    const ID_A: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// Partitioned in-scope schema: id UUID PK, debit NUMERIC,
+    /// effective_at_local TIMESTAMPTZ (partition key), description TEXT.
+    fn partitioned_schema() -> ReplicatedTableSchema {
+        let table_schema = TableSchema::new(
+            TableId::new(1),
+            TableName::new("public".to_owned(), "lines".to_owned()),
+            vec![
+                ColumnSchema::new("id".to_owned(), PgType::UUID, -1, 1, Some(1), false),
+                ColumnSchema::new("debit".to_owned(), PgType::NUMERIC, -1, 2, None, true),
+                ColumnSchema::new(
+                    "effective_at_local".to_owned(),
+                    PgType::TIMESTAMPTZ,
+                    -1,
+                    3,
+                    None,
+                    false,
+                ),
+                ColumnSchema::new("description".to_owned(), PgType::TEXT, -1, 4, None, true),
+            ],
+        );
+        ReplicatedTableSchema::all(Arc::new(table_schema))
+    }
+
+    fn ts(s: &str) -> Cell {
+        let dt: DateTime<Utc> = s.parse().expect("valid timestamp");
+        Cell::TimestampTz(dt)
+    }
+
+    fn full_row(eff: &str, desc: &str) -> TableRow {
+        TableRow::new(vec![
+            Cell::String(ID_A.to_owned()),
+            Cell::Numeric(etl::types::PgNumeric::from_str("12.50").unwrap()),
+            ts(eff),
+            Cell::String(desc.to_owned()),
+        ])
+    }
+
+    fn tracked(seq: u64, mutation: TableMutation) -> TrackedTableMutation {
+        TrackedTableMutation::new(PgLsn::from(100u64), PgLsn::from(100u64), seq, mutation)
+    }
+
+    /// Extracts `(version, deleted)` from one produced append batch.
+    fn append_cdc(mutation: &PreparedTableMutation) -> (u128, bool) {
+        let PreparedTableMutation::Append { rows } = mutation else {
+            panic!("expected Append, got a different prepared mutation");
+        };
+        let batch = &rows.batch;
+        let ncols = batch.num_columns();
+        let version_col = batch
+            .column(ncols - 2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("version column is Decimal128");
+        let deleted_col = batch
+            .column(ncols - 1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("deleted column is Boolean");
+        (version_col.value(0) as u128, deleted_col.value(0))
+    }
+
+    #[test]
+    fn insert_then_same_partition_update_emits_two_live_appends() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Update {
+                    delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1")),
+                    new_row: UpdatedTableRow::Full(full_row("2026-05-12T00:00:00Z", "v2")),
+                },
+            ),
+        ];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(appends.len(), 2, "insert + same-partition update => 2 live appends");
+        let (v0, d0) = append_cdc(&appends[0]);
+        let (v1, d1) = append_cdc(&appends[1]);
+        assert!(!d0 && !d1, "both live");
+        assert!(v1 > v0, "second append has the higher version");
+        assert_eq!(v0, version_u128(PgLsn::from(100u64), 0));
+        assert_eq!(v1, version_u128(PgLsn::from(100u64), 1));
+    }
+
+    #[test]
+    fn delete_emits_single_tombstone_append() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![tracked(
+            3,
+            TableMutation::Delete(OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1"))),
+        )];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(appends.len(), 1);
+        let (_, deleted) = append_cdc(&appends[0]);
+        assert!(deleted, "delete => tombstone");
+    }
+
+    #[test]
+    fn partition_move_emits_tombstone_then_live() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![tracked(
+            5,
+            TableMutation::Update {
+                delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1")),
+                new_row: UpdatedTableRow::Full(full_row("2026-07-02T00:00:00Z", "v2")),
+            },
+        )];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(appends.len(), 2, "move => tombstone + live");
+        let (vt, dt) = append_cdc(&appends[0]);
+        let (vl, dl) = append_cdc(&appends[1]);
+        assert!(dt, "first append is the old-partition tombstone");
+        assert!(!dl, "second append is the new-partition live image");
+        assert_eq!(vt, vl, "tombstone and live share the same version V");
+    }
+
+    #[test]
+    fn partial_update_reconstructs_full_image_from_old_row() {
+        // Unchanged-TOAST update: only id + debit present; description missing,
+        // taken from the full old row. Same partition, so one live append.
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // Present columns (replicated order, missing excluded): id, debit, eff.
+        let present = TableRow::new(vec![
+            Cell::String(ID_A.to_owned()),
+            Cell::Numeric(etl::types::PgNumeric::from_str("99.00").unwrap()),
+            ts("2026-05-20T00:00:00Z"),
+        ]);
+        let partial = PartialTableRow::new(4, present, vec![3]); // description missing
+        let muts = vec![tracked(
+            7,
+            TableMutation::Update {
+                delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "kept-desc")),
+                new_row: UpdatedTableRow::Partial(partial),
+            },
+        )];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(appends.len(), 1, "same-partition partial update => 1 live append");
+        let (_, deleted) = append_cdc(&appends[0]);
+        assert!(!deleted);
+        // The reconstructed description must come from the old row.
+        let PreparedTableMutation::Append { rows } = &appends[0] else { unreachable!() };
+        let desc = rows
+            .batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .expect("description is Utf8");
+        assert_eq!(desc.value(0), "kept-desc");
+    }
+
+    /// Unpartitioned in-scope schema: id INT4 PK not-null, label TEXT nullable,
+    /// score INT4 not-null.
+    fn unpartitioned_schema() -> ReplicatedTableSchema {
+        let table_schema = TableSchema::new(
+            TableId::new(2),
+            TableName::new("public".to_owned(), "observations".to_owned()),
+            vec![
+                ColumnSchema::new("id".to_owned(), PgType::INT4, -1, 1, Some(1), false),
+                ColumnSchema::new("label".to_owned(), PgType::TEXT, -1, 2, None, true),
+                ColumnSchema::new("score".to_owned(), PgType::INT4, -1, 3, None, false),
+            ],
+        );
+        ReplicatedTableSchema::all(Arc::new(table_schema))
+    }
+
+    #[test]
+    fn key_only_delete_on_unpartitioned_table_emits_expanded_tombstone() {
+        // Unpartitioned table delete: OldTableRow::Key carries only the PK.
+        // prepare_append_mutations must expand the key row to full width and
+        // emit exactly one Append with _etl_deleted = true.
+        let schema = unpartitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![tracked(
+            11,
+            TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::I32(42)]))),
+        )];
+        let appends = prepare_append_mutations(&schema, muts, false, &specs).unwrap();
+        assert_eq!(appends.len(), 1, "one tombstone append for the delete");
+        let (_, deleted) = append_cdc(&appends[0]);
+        assert!(deleted, "delete => tombstone (_etl_deleted = true)");
+
+        // Inspect the expanded row: PK kept, nullable TEXT -> NULL, non-nullable INT4 -> 0.
+        let PreparedTableMutation::Append { rows } = &appends[0] else {
+            unreachable!("already asserted Append above");
+        };
+        let batch = &rows.batch;
+        // col 0: id (INT4 PK) must be 42.
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.value(0), 42, "PK value preserved by expand_key_row");
+        // col 1: label (nullable TEXT) must be NULL.
+        assert!(batch.column(1).is_null(0), "nullable TEXT column expanded to NULL");
+        // col 2: score (non-nullable INT4) must be 0.
+        let score_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("score column is Int32");
+        assert_eq!(score_col.value(0), 0, "non-nullable INT4 column expanded to zero");
+    }
+
+    #[test]
+    fn key_only_old_row_on_partitioned_delete_errors() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![tracked(
+            9,
+            TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::String(
+                ID_A.to_owned(),
+            )]))),
+        )];
+        let err = match prepare_append_mutations(&schema, muts, true, &specs) {
+            Ok(_) => panic!("expected key-only delete to error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::SourceReplicaIdentityError);
+    }
+
+    /// Builds the cdc-augmented target table DDL, stages every produced append,
+    /// runs the same plain INSERT the apply path runs, then resolves current
+    /// state with the production dedup query. Returns `(version, deleted, desc)`
+    /// for the surviving row of `ID_A` after dedup (NOT filtering tombstones),
+    /// scoped to the given month so partition semantics are observable.
+    fn apply_and_read_back(
+        appends: &[PreparedTableMutation],
+        specs: &[StagingColumnSpec],
+        month: u32,
+    ) -> Option<(String, bool, Option<String>)> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET TimeZone = 'UTC';").unwrap();
+        let target_ddl = specs
+            .iter()
+            .map(|s| format!("{} {}", quote_identifier(&s.name), s.staging_sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let staging_ddl = target_ddl.clone();
+        conn.execute_batch(&format!(
+            "CREATE TABLE target ({target_ddl}); CREATE TEMP TABLE staging ({staging_ddl});"
+        ))
+        .unwrap();
+
+        let insert_columns =
+            specs.iter().map(|s| quote_identifier(&s.name)).collect::<Vec<_>>().join(", ");
+        let select_exprs =
+            specs.iter().map(StagingColumnSpec::select_expr).collect::<Vec<_>>().join(", ");
+
+        for mutation in appends {
+            let PreparedTableMutation::Append { rows } = mutation else {
+                panic!("expected Append");
+            };
+            conn.execute_batch("DELETE FROM staging;").unwrap();
+            let mut appender = conn.appender("staging").unwrap();
+            appender.append_record_batch(rows.batch.clone()).unwrap();
+            appender.flush().unwrap();
+            drop(appender);
+            conn.execute_batch(&format!(
+                "INSERT INTO target ({insert_columns}) SELECT {select_exprs} FROM staging;"
+            ))
+            .unwrap();
+        }
+
+        // Production dedup, scoped to one partition month (the pruning predicate).
+        let sql = format!(
+            "SELECT \"_etl_version\"::VARCHAR, \"_etl_deleted\", \"description\" FROM (\
+               SELECT * FROM target WHERE month(\"effective_at_local\") = {month} \
+               QUALIFY ROW_NUMBER() OVER (PARTITION BY \"id\" \
+                 ORDER BY \"_etl_version\" DESC, \"_etl_deleted\" ASC) = 1)"
+        );
+        conn.query_row(&sql, [], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .ok()
+    }
+
+    #[test]
+    fn end_to_end_same_partition_update_dedups_to_latest() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Update {
+                    delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1")),
+                    new_row: UpdatedTableRow::Full(full_row("2026-05-12T00:00:00Z", "v2")),
+                },
+            ),
+        ];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        let (_, deleted, desc) = apply_and_read_back(&appends, &specs, 5).unwrap();
+        assert!(!deleted, "latest is live");
+        assert_eq!(desc.as_deref(), Some("v2"), "dedup picks the higher version");
+    }
+
+    #[test]
+    fn end_to_end_delete_latest_is_tombstone() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Delete(OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1"))),
+            ),
+        ];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        let (_, deleted, _) = apply_and_read_back(&appends, &specs, 5).unwrap();
+        assert!(deleted, "latest version row is the tombstone");
+    }
+
+    #[test]
+    fn end_to_end_move_old_partition_tombstoned_new_partition_live() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Update {
+                    delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1")),
+                    new_row: UpdatedTableRow::Full(full_row("2026-07-02T00:00:00Z", "v2")),
+                },
+            ),
+        ];
+        let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        // Old partition (May): the move tombstone wins -> deleted row.
+        let (_, deleted_may, _) = apply_and_read_back(&appends, &specs, 5).unwrap();
+        assert!(deleted_may, "old partition row is a tombstone");
+        // New partition (July): the live image is present.
+        let (_, deleted_jul, desc_jul) = apply_and_read_back(&appends, &specs, 7).unwrap();
+        assert!(!deleted_jul, "new partition has the live image");
+        assert_eq!(desc_jul.as_deref(), Some("v2"));
     }
 }

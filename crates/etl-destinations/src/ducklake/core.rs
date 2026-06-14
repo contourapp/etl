@@ -2096,6 +2096,7 @@ where
                                 &segment.replicated_table_schema,
                                 destination_table_name.clone(),
                                 pending_mutations,
+                                &destination.merge_on_read_scope,
                             )?;
                             apply_table_batches_with_retry(
                                 Arc::clone(&destination.pool),
