@@ -177,6 +177,14 @@ pub enum DestinationConfig {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// Tables that use merge-on-read CDC semantics.
+        ///
+        /// When non-empty, CDC mutations for the listed tables are written as
+        /// append-only rows annotated with `_etl_version` and `_etl_deleted`
+        /// instead of in-place updates/deletes. Defaults to empty (standard
+        /// behavior for all tables).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merge_on_read_tables: Vec<String>,
     },
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
@@ -398,6 +406,14 @@ pub enum DestinationConfigWithoutSecrets {
         /// External maintenance coordination backend.
         #[serde(default)]
         maintenance_mode: DuckLakeMaintenanceMode,
+        /// Tables that use merge-on-read CDC semantics.
+        ///
+        /// When non-empty, CDC mutations for the listed tables are written as
+        /// append-only rows annotated with `_etl_version` and `_etl_deleted`
+        /// instead of in-place updates/deletes. Defaults to empty (standard
+        /// behavior for all tables).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merge_on_read_tables: Vec<String>,
     },
     Snowflake {
         /// Snowflake account identifier in "ORGNAME-ACCOUNTNAME" format.
@@ -449,6 +465,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                merge_on_read_tables,
             } => DestinationConfigWithoutSecrets::Ducklake {
                 data_path,
                 pool_size,
@@ -460,6 +477,7 @@ impl From<DestinationConfig> for DestinationConfigWithoutSecrets {
                 maintenance_target_file_size,
                 expire_snapshots_older_than,
                 maintenance_mode,
+                merge_on_read_tables,
             },
             DestinationConfig::Snowflake {
                 account_id,
@@ -500,6 +518,7 @@ mod tests {
             maintenance_target_file_size: None,
             expire_snapshots_older_than: None,
             maintenance_mode: DuckLakeMaintenanceMode::Kubernetes,
+            merge_on_read_tables: vec![],
         };
 
         let without_secrets = DestinationConfigWithoutSecrets::from(config);

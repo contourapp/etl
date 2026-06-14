@@ -44,7 +44,7 @@ use url::Url;
 
 use crate::{
     ducklake::{
-        DuckLakeTableName, LAKE_CATALOG, S3Config,
+        DuckLakeTableName, LAKE_CATALOG, MergeOnReadScope, S3Config,
         batches::{
             DuckLakeTableBatchKind, TableMutation, TrackedTableMutation, TrackedTruncateEvent,
             apply_table_batch_with_retry, apply_table_batches_with_retry,
@@ -176,6 +176,10 @@ pub struct DuckLakeDestination<S> {
     /// Tables whose `data_inlining_row_limit` was restored to the attach-time
     /// default once streaming writes began.
     streaming_inlining_restored: Arc<Mutex<HashSet<DuckLakeTableName>>>,
+    /// Predicate identifying which tables use merge-on-read CDC semantics.
+    /// Consumed by later tasks; stored here so it travels with the destination.
+    #[allow(dead_code)]
+    merge_on_read_scope: MergeOnReadScope,
 }
 
 /// Held by an external DuckLake maintenance coordinator while foreground
@@ -919,6 +923,7 @@ where
             DuckLakeExternalMaintenanceConfig::default(),
             store,
             tables,
+            vec![],
         )
         .await
     }
@@ -951,6 +956,7 @@ where
             DuckLakeExternalMaintenanceConfig::default(),
             store,
             tables,
+            vec![],
         )
         .await
     }
@@ -971,6 +977,7 @@ where
         external_maintenance: DuckLakeExternalMaintenanceConfig,
         store: S,
         tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
+        merge_on_read_tables: Vec<String>,
     ) -> EtlResult<Self> {
         register_metrics();
         set_abort_on_blocking_timeout(abort_on_timeout);
@@ -1108,6 +1115,7 @@ where
         let metadata_pg_pool = build_ducklake_metadata_pg_pool(&catalog_url)?;
         let created_tables = Arc::default();
         let checkpoint_gate = Arc::new(RwLock::new(()));
+        let merge_on_read_scope = MergeOnReadScope::from_tables(merge_on_read_tables);
         let mut destination = Self {
             manager: Arc::clone(&manager),
             pool: Arc::clone(&pool),
@@ -1127,6 +1135,7 @@ where
             table_storage_config: Arc::new(tables),
             copy_inlining_zeroed: Arc::default(),
             streaming_inlining_restored: Arc::default(),
+            merge_on_read_scope,
         };
         gauge!(ETL_DUCKLAKE_POOL_SIZE).set(pool_size as f64);
         let shutdown_signal_manager = Arc::clone(&manager);

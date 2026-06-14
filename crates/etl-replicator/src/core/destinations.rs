@@ -214,6 +214,7 @@ mod ducklake {
             maintenance_target_file_size,
             expire_snapshots_older_than,
             maintenance_mode,
+            merge_on_read_tables,
         } = &replicator_config.destination
         else {
             unreachable!("Destination kind should match DuckLake config");
@@ -257,6 +258,7 @@ mod ducklake {
             external_maintenance,
             store.clone(),
             HashMap::new(),
+            merge_on_read_tables.clone(),
         )
         .await?;
 

@@ -6,6 +6,7 @@ mod core;
 mod encoding;
 mod external_maintenance;
 mod inline_size;
+mod merge_on_read;
 mod metrics;
 mod schema;
 mod sql;
@@ -27,6 +28,7 @@ pub use core::{
     DuckLakeDestination, DuckLakeExternalMaintenanceConfig, DuckLakeExternalMaintenancePause,
     DuckLakeMaintenanceMode, table_name_to_ducklake_table_name,
 };
+pub use merge_on_read::MergeOnReadScope;
 pub use schema::{SortDirection, SortKey, TableStorageConfig};
 #[cfg(feature = "test-utils")]
 pub use core::{
