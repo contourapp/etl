@@ -4180,4 +4180,83 @@ mod merge_on_read_apply_tests {
         // Insert (1) + same-partition update (1) + partition-move (2: tombstone + live) + delete (1) = 5
         assert_eq!(ops.len(), 5, "expected 5 append ops for the representative mix");
     }
+
+    /// Task 8 — unchanged-TOAST behavioral guard: a partial update (simulating
+    /// an unchanged-TOAST column) must produce an appended image that carries the
+    /// real old-row value for the missing column, not a placeholder or NULL.
+    ///
+    /// Unchanged-TOAST is resolved by the `etl` crate upstream of this layer:
+    /// `convert_tuple_data_to_cell` turns `UnchangedToast` into either a
+    /// recovered `Cell` (if the old row is available) or a `Missing` index
+    /// (surfaced as `UpdatedTableRow::Partial`). `reconstruct_full_new_row` then
+    /// overlays the partial row onto the full old image so no placeholder can
+    /// reach the append. This test proves that invariant for the unpartitioned path.
+    ///
+    /// See also: `partial_update_reconstructs_full_image_from_old_row` (which
+    /// covers the partitioned path) and the `overlay_partial_on_full` function,
+    /// which is the mechanism that prevents unchanged-TOAST corruption.
+    #[test]
+    fn unchanged_toast_column_carries_real_old_value_in_append() {
+        // Unpartitioned schema: id INT4 PK, label TEXT nullable, score INT4.
+        let schema = unpartitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        // Simulate an unchanged-TOAST update: only `id` and `score` changed;
+        // `label` is missing (index 1) — this is exactly what
+        // `convert_update_tuple_to_updated_table_row` produces when PostgreSQL
+        // emits `UnchangedToast` for a column it cannot recover from the old row.
+        let old_full_row = TableRow::new(vec![
+            Cell::I32(7),
+            Cell::String("original-label".to_owned()),
+            Cell::I32(10),
+        ]);
+        let present = TableRow::new(vec![
+            Cell::I32(7),  // id unchanged
+            Cell::I32(99), // score changed
+        ]);
+        // `label` (index 1) is missing — the unchanged-TOAST placeholder.
+        let partial = PartialTableRow::new(3, present, vec![1]);
+
+        let muts = vec![tracked(
+            42,
+            TableMutation::Update {
+                delete_row: OldTableRow::Full(old_full_row),
+                new_row: UpdatedTableRow::Partial(partial),
+            },
+        )];
+
+        let ops = prepare_append_mutations(&schema, muts, false, &specs).unwrap();
+
+        // Must produce exactly one Append (same-partition unpartitioned update).
+        assert_eq!(ops.len(), 1);
+        let PreparedTableMutation::Append { rows } = &ops[0] else {
+            panic!("expected Append");
+        };
+
+        // The label column (index 1) must carry the real old value, not NULL or
+        // a placeholder. If unchanged-TOAST leaked through, this would be NULL.
+        let label_col = rows
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .expect("label column is Utf8");
+        assert_eq!(
+            label_col.value(0),
+            "original-label",
+            "unchanged-TOAST column must carry the real old-row value in the append image"
+        );
+
+        // The score column (index 2) must carry the new value.
+        let score_col = rows
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::Int32Array>()
+            .expect("score column is Int32");
+        assert_eq!(score_col.value(0), 99, "changed column carries the new value");
+    }
 }
