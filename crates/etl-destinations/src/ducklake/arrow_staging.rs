@@ -222,6 +222,19 @@ mod spec_tests {
         ColumnSchema::new(name.to_owned(), typ, -1, 1, None, true)
     }
 
+    fn sample_line_column_schemas() -> Vec<ColumnSchema> {
+        vec![col("n", Type::INT8), col("t", Type::TEXT)]
+    }
+
+    #[test]
+    fn specs_with_cdc_append_two() {
+        let base = build_staging_specs(&sample_line_column_schemas()).unwrap();
+        let cdc = build_staging_specs_with_cdc(&sample_line_column_schemas()).unwrap();
+        assert_eq!(cdc.len(), base.len() + 2);
+        assert_eq!(cdc[cdc.len() - 2].name, "_etl_version");
+        assert_eq!(cdc[cdc.len() - 1].name, "_etl_deleted");
+    }
+
     #[test]
     fn specs_for_scalars_are_identity() {
         let specs = build_staging_specs(&[col("n", Type::INT8), col("t", Type::TEXT)]).unwrap();
@@ -424,6 +437,87 @@ pub(super) fn build_record_batch(
         etl_error!(
             ErrorKind::ConversionError,
             "Failed to assemble Arrow record batch for staging",
+            error.to_string()
+        )
+    })
+}
+
+/// Extends a base set of staging specs with two trailing CDC columns:
+/// `_etl_version` (packed u128 version, carried as Decimal128(38,0) and cast
+/// to UHUGEINT at read time) and `_etl_deleted` (boolean tombstone flag).
+// Consumed by Task 6.
+#[allow(dead_code)]
+pub(super) fn build_staging_specs_with_cdc(
+    column_schemas: &[ColumnSchema],
+) -> EtlResult<Vec<StagingColumnSpec>> {
+    use super::merge_on_read::{ETL_DELETED_COLUMN, ETL_VERSION_COLUMN, ETL_VERSION_SQL_TYPE};
+    let mut specs = build_staging_specs(column_schemas)?;
+    specs.push(StagingColumnSpec {
+        name: ETL_VERSION_COLUMN.into(),
+        arrow_type: DataType::Decimal128(38, 0),
+        staging_sql_type: "DECIMAL(38,0)".into(),
+        cast: CastKind::To(ETL_VERSION_SQL_TYPE.into()),
+    });
+    specs.push(StagingColumnSpec {
+        name: ETL_DELETED_COLUMN.into(),
+        arrow_type: DataType::Boolean,
+        staging_sql_type: "BOOLEAN".into(),
+        cast: CastKind::Identity,
+    });
+    Ok(specs)
+}
+
+/// Builds a RecordBatch with CDC-augmented specs: user columns are built
+/// exactly as [`build_record_batch`] does (reusing [`build_column`] per spec),
+/// then two constant trailing columns are appended — a Decimal128(38,0) holding
+/// `version as i128` for every row, and a Boolean holding `deleted` for every
+/// row.
+///
+/// `version` is a packed `u128` (high 64 bits = commit_lsn, low 64 bits =
+/// tx_ordinal). Realistic values stay far below `i128::MAX`, so the cast is
+/// safe in practice. An explicit guard returns an `EtlResult` error on overflow
+/// rather than panicking, in case of future version-encoding changes.
+// Consumed by Task 6.
+#[allow(dead_code)]
+pub(super) fn build_record_batch_with_cdc(
+    rows: &[TableRow],
+    specs: &[StagingColumnSpec],
+    version: u128,
+    deleted: bool,
+) -> EtlResult<RecordBatch> {
+    let version_i128 = i128::try_from(version).map_err(|_| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "CDC version overflows i128",
+            format!("version {version} does not fit in Decimal128(38,0)")
+        )
+    })?;
+    let row_count = rows.len();
+    let user_count = specs.len().saturating_sub(2);
+    let mut fields = Vec::with_capacity(specs.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(specs.len());
+    for (index, spec) in specs[..user_count].iter().enumerate() {
+        fields.push(Field::new(spec.name.as_str(), spec.arrow_type.clone(), true));
+        arrays.push(build_column(spec, index, rows)?);
+    }
+    let version_spec = &specs[user_count];
+    fields.push(Field::new(version_spec.name.as_str(), version_spec.arrow_type.clone(), true));
+    let mut version_builder = decimal_builder(38, 0)?;
+    for _ in 0..row_count {
+        version_builder.append_value(version_i128);
+    }
+    arrays.push(Arc::new(version_builder.finish()) as ArrayRef);
+    let deleted_spec = &specs[user_count + 1];
+    fields.push(Field::new(deleted_spec.name.as_str(), deleted_spec.arrow_type.clone(), true));
+    let mut deleted_builder = duckdb::arrow::array::BooleanBuilder::with_capacity(row_count);
+    for _ in 0..row_count {
+        deleted_builder.append_value(deleted);
+    }
+    arrays.push(Arc::new(deleted_builder.finish()) as ArrayRef);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|error| {
+        etl_error!(
+            ErrorKind::ConversionError,
+            "Failed to assemble CDC Arrow record batch for staging",
             error.to_string()
         )
     })
@@ -1227,6 +1321,32 @@ mod batch_tests {
         assert!(message.contains("debit"), "missing column name: {message}");
         assert!(message.contains("Bool"), "missing variant name: {message}");
         assert!(!message.contains("true"), "leaked cell value: {message}");
+    }
+
+    #[test]
+    fn record_batch_with_cdc_has_version_and_deleted() {
+        use duckdb::arrow::array::{BooleanArray, Decimal128Array};
+        let specs = build_staging_specs_with_cdc(&lines_like_schema()).unwrap();
+        let rows = sample_rows();
+        let batch = build_record_batch_with_cdc(&rows, &specs, 42u128, false).unwrap();
+        assert_eq!(batch.num_columns(), specs.len());
+        assert_eq!(batch.num_rows(), rows.len());
+        let version_col = batch
+            .column(specs.len() - 2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_etl_version should be Decimal128Array");
+        for i in 0..rows.len() {
+            assert_eq!(version_col.value(i), 42i128, "row {i}: expected version 42");
+        }
+        let deleted_col = batch
+            .column(specs.len() - 1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("_etl_deleted should be BooleanArray");
+        for i in 0..rows.len() {
+            assert!(!deleted_col.value(i), "row {i}: expected deleted=false");
+        }
     }
 
     /// Builds the staging payload for a single-column schema, creates a real
