@@ -4124,4 +4124,60 @@ mod merge_on_read_apply_tests {
         assert!(!deleted_jul, "new partition has the live image");
         assert_eq!(desc_jul.as_deref(), Some("v2"));
     }
+
+    /// Task 7 — regression guard: every mutation type must produce only `Append`
+    /// ops (never `Merge`, `Delete`, `Update`, `DedupedUpsert`, or `Upsert`).
+    ///
+    /// `Append` is the only scan-free INSERT path; any other variant would
+    /// reintroduce a target-table scan for in-scope tables. This test fails if
+    /// a future change routes any mutation through the non-append path.
+    #[test]
+    fn merge_on_read_emits_only_append_ops() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        // Representative mix:
+        //   seq 0: Insert
+        //   seq 1: same-partition Update (effective_at stays in May)
+        //   seq 2: partition-move Update (effective_at moves from May to July)
+        //   seq 3: Delete
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Update {
+                    delete_row: OldTableRow::Full(full_row("2026-05-10T00:00:00Z", "v1")),
+                    new_row: UpdatedTableRow::Full(full_row("2026-05-12T00:00:00Z", "v2")),
+                },
+            ),
+            tracked(
+                2,
+                TableMutation::Update {
+                    delete_row: OldTableRow::Full(full_row("2026-05-12T00:00:00Z", "v2")),
+                    new_row: UpdatedTableRow::Full(full_row("2026-07-01T00:00:00Z", "v3")),
+                },
+            ),
+            tracked(
+                3,
+                TableMutation::Delete(OldTableRow::Full(full_row("2026-07-01T00:00:00Z", "v3"))),
+            ),
+        ];
+
+        let ops = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+
+        // Every op must be an Append — never Merge, Delete, Update, DedupedUpsert, or Upsert.
+        for (i, op) in ops.iter().enumerate() {
+            assert!(
+                matches!(op, PreparedTableMutation::Append { .. }),
+                "op[{i}] is not an Append; in-scope tables must never produce scan-bearing ops"
+            );
+        }
+
+        // Sanity-check the expected count:
+        // Insert (1) + same-partition update (1) + partition-move (2: tombstone + live) + delete (1) = 5
+        assert_eq!(ops.len(), 5, "expected 5 append ops for the representative mix");
+    }
 }
