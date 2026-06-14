@@ -25,6 +25,7 @@ pub(super) type DuckLakeTableName = String;
 /// materialized to Parquet by an external maintenance job.
 const ATTACH_DATA_INLINING_ROW_LIMIT: u64 = 10_000;
 
+pub use compaction::{run_merge_on_read_compaction, run_merge_on_read_global_dedup};
 pub use core::{
     DuckLakeDestination, DuckLakeExternalMaintenanceConfig, DuckLakeExternalMaintenancePause,
     DuckLakeMaintenanceMode, table_name_to_ducklake_table_name,

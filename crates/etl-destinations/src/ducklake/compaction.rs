@@ -109,8 +109,6 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
 /// # Errors
 /// Returns an `EtlError` wrapping the underlying `duckdb::Error` on any SQL
 /// failure, mirroring the error handling pattern in `batches.rs`.
-// Consumed by Task 11 (maintenance task wiring).
-#[allow(dead_code)]
 pub(super) fn compact_partition(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     collapse_by_id(conn, table)
 }
@@ -138,17 +136,63 @@ pub(super) fn compact_partition(conn: &duckdb::Connection, table: &str) -> EtlRe
 /// # Errors
 /// Returns an `EtlError` wrapping the underlying `duckdb::Error` on any SQL
 /// failure.
-// Consumed by cutover (Task 20).
-#[allow(dead_code)]
 pub(super) fn global_dedup_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     collapse_by_id(conn, table)
+}
+
+/// Runs merge-on-read compaction across all given tables, collapsing
+/// multi-version append logs down to at most one live row per `id`.
+///
+/// Callers control invocation frequency — the maintenance interval in
+/// contour-core determines how often this runs. Per-table version-count gating
+/// (skipping tables with few versions) is a future optimization; for now every
+/// listed table is compacted on each call.
+///
+/// Stops on the first error and returns it; tables listed after the failing one
+/// are not processed.
+///
+/// # Errors
+/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on the first
+/// table that fails.
+pub fn run_merge_on_read_compaction(
+    conn: &duckdb::Connection,
+    tables: &[String],
+) -> EtlResult<()> {
+    for table in tables {
+        tracing::info!(table = %table, "DuckLake: compacting merge-on-read table");
+        compact_partition(conn, table)?;
+    }
+    Ok(())
+}
+
+/// Runs a one-time global dedup pass across all given tables, removing
+/// backlog-move strandings that per-partition compaction cannot resolve.
+///
+/// This is the cutover pass — run once after the initial backlog load before
+/// switching to incremental compaction via [`run_merge_on_read_compaction`].
+///
+/// Stops on the first error and returns it; tables listed after the failing one
+/// are not processed.
+///
+/// # Errors
+/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on the first
+/// table that fails.
+pub fn run_merge_on_read_global_dedup(
+    conn: &duckdb::Connection,
+    tables: &[String],
+) -> EtlResult<()> {
+    for table in tables {
+        tracing::info!(table = %table, "DuckLake: running global dedup on table");
+        global_dedup_by_id(conn, table)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod compaction_tests {
     use duckdb::Connection;
 
-    use super::{compact_partition, global_dedup_by_id};
+    use super::{compact_partition, global_dedup_by_id, run_merge_on_read_compaction};
 
     fn open() -> Connection {
         Connection::open_in_memory().unwrap()
@@ -266,5 +310,74 @@ mod compaction_tests {
             .query_row("SELECT effective_month FROM t WHERE id = 7", [], |r| r.get(0))
             .unwrap();
         assert_eq!(month_after, 7, "idempotent: month=7 still survives after second call");
+    }
+
+    #[test]
+    fn run_merge_on_read_compaction_compacts_multiple_tables() {
+        // Two tables, each with a multi-version row and a tombstone group.
+        // After run_merge_on_read_compaction both must be collapsed correctly:
+        //   t1: id=1 (v1→v2 live) survives with credit=20; id=2 (tombstone) dropped.
+        //   t2: id=10 (v1→v2 live) survives with score=99; id=20 (tombstone) dropped.
+        let conn = open();
+
+        conn.execute_batch(
+            "CREATE TABLE t1 (id INTEGER, credit INTEGER, _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t1 VALUES
+               (1, 10, 1, false),
+               (1, 20, 2, false),
+               (2, 5,  1, false),
+               (2, 0,  2, true);",
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE t2 (id INTEGER, score INTEGER, _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t2 VALUES
+               (10, 50,  1, false),
+               (10, 99,  2, false),
+               (20, 30,  1, false),
+               (20, 0,   2, true);",
+        )
+        .unwrap();
+
+        run_merge_on_read_compaction(&conn, &["t1".to_string(), "t2".to_string()]).unwrap();
+
+        // t1 assertions
+        let t1_credit: i32 = conn
+            .query_row("SELECT credit FROM t1 WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t1_credit, 20, "t1 id=1: must keep v2 live row with credit=20");
+
+        let t1_id2_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t1 WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t1_id2_count, 0, "t1 id=2: tombstone group must be fully dropped");
+
+        let t1_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t1_total, 1, "t1: exactly one live row survives");
+
+        // t2 assertions
+        let t2_score: i32 = conn
+            .query_row("SELECT score FROM t2 WHERE id = 10", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t2_score, 99, "t2 id=10: must keep v2 live row with score=99");
+
+        let t2_id20_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t2 WHERE id = 20", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t2_id20_count, 0, "t2 id=20: tombstone group must be fully dropped");
+
+        let t2_total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t2_total, 1, "t2: exactly one live row survives");
     }
 }
