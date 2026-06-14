@@ -1,6 +1,9 @@
 use etl::types::{ColumnSchema, Type, is_array_type};
 
-use crate::ducklake::sql::{qualified_lake_table_name, quote_identifier};
+use crate::ducklake::{
+    merge_on_read::{ETL_DELETED_COLUMN, ETL_VERSION_COLUMN, ETL_VERSION_SQL_TYPE},
+    sql::{qualified_lake_table_name, quote_identifier},
+};
 
 /// Returns the DuckLake SQL type string for a given Postgres scalar type.
 fn postgres_scalar_type_to_ducklake_sql(typ: &Type) -> &'static str {
@@ -125,6 +128,46 @@ pub(super) fn build_create_table_sql_ducklake(
     format!("create table if not exists {table_name} ({})", col_defs.join(",\n"))
 }
 
+/// Builds a `create table if not exists` DDL statement with the two trailing
+/// merge-on-read CDC columns (`_etl_version UHUGEINT`, `_etl_deleted BOOLEAN`).
+///
+/// Both columns are nullable so existing rows written before CDC was enabled
+/// do not require a rewrite — NULL version = base generation, NULL deleted = live.
+// Consumed by Task 17 (wiring into the create/ensure path).
+#[allow(dead_code)]
+pub(super) fn build_create_table_sql_with_cdc(
+    table_name: &str,
+    column_schemas: &[ColumnSchema],
+) -> String {
+    let mut sql = build_create_table_sql_ducklake(table_name, column_schemas);
+    let trailing = format!(
+        ",\n  {} {},\n  {} BOOLEAN",
+        quote_identifier(ETL_VERSION_COLUMN),
+        ETL_VERSION_SQL_TYPE,
+        quote_identifier(ETL_DELETED_COLUMN)
+    );
+    let close = sql.rfind(')').expect("create table has closing paren");
+    sql.insert_str(close, &trailing);
+    sql
+}
+
+/// Builds one or two `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements that
+/// add the merge-on-read CDC columns to an already-existing table.
+///
+/// Both columns are added as nullable so existing rows need no backfill.
+/// `IF NOT EXISTS` makes the statements safe to replay.
+// Consumed by Task 17 (wiring into the create/ensure path).
+#[allow(dead_code)]
+pub(super) fn build_add_cdc_columns_sql(qualified_table: &str) -> String {
+    format!(
+        "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {v} {vt};\nALTER TABLE {t} ADD COLUMN IF NOT EXISTS {d} BOOLEAN;",
+        t = qualified_table,
+        v = quote_identifier(ETL_VERSION_COLUMN),
+        vt = ETL_VERSION_SQL_TYPE,
+        d = quote_identifier(ETL_DELETED_COLUMN)
+    )
+}
+
 /// Builds a DuckLake `alter table add column` statement.
 ///
 /// Added columns are always nullable at the destination because existing rows
@@ -217,6 +260,33 @@ pub(super) fn build_alter_table_storage_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_line_columns() -> Vec<ColumnSchema> {
+        vec![
+            ColumnSchema::new("id".to_owned(), Type::INT8, -1, 1, Some(1), false),
+            ColumnSchema::new("name".to_owned(), Type::TEXT, -1, 2, None, true),
+        ]
+    }
+
+    #[test]
+    fn create_includes_cdc() {
+        let sql = build_create_table_sql_with_cdc("public_lines", &sample_line_columns());
+        assert!(sql.contains("\"_etl_version\" UHUGEINT"), "sql: {sql}");
+        assert!(sql.contains("\"_etl_deleted\" BOOLEAN"), "sql: {sql}");
+    }
+
+    #[test]
+    fn add_cdc_is_idempotent_nullable() {
+        let sql = build_add_cdc_columns_sql("\"lake\".\"public_lines\"");
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS \"_etl_version\" UHUGEINT"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS \"_etl_deleted\" BOOLEAN"),
+            "sql: {sql}"
+        );
+    }
 
     #[test]
     fn scalar_type_mapping() {
