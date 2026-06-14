@@ -1,6 +1,7 @@
 mod arrow_staging;
 mod batches;
 mod client;
+mod compaction;
 mod config;
 mod core;
 mod encoding;
