@@ -204,6 +204,11 @@ impl MergeOnReadScope {
     pub fn is_partitioned(&self, t: &str) -> bool {
         self.partitioned.contains(t)
     }
+
+    /// Returns all table names in the merge-on-read scope.
+    pub fn tables(&self) -> Vec<String> {
+        self.tables.iter().cloned().collect()
+    }
 }
 
 #[cfg(test)]

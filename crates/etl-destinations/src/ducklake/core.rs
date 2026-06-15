@@ -1365,6 +1365,41 @@ where
         Ok(dropped)
     }
 
+    /// Compacts the merge-on-read append log for every in-scope table,
+    /// collapsing multi-version rows down to at most one live row per `id`.
+    ///
+    /// Acquires a DuckDB connection from the pool, then delegates to
+    /// [`crate::ducklake::compaction::run_merge_on_read_compaction`]. If the
+    /// merge-on-read scope is empty the call is a no-op.
+    pub async fn compact_merge_on_read(&self) -> EtlResult<()> {
+        let tables = self.merge_on_read_scope.tables();
+        if tables.is_empty() {
+            return Ok(());
+        }
+        self.run_duckdb_blocking(move |conn| {
+            crate::ducklake::compaction::run_merge_on_read_compaction(conn, &tables)
+        })
+        .await
+    }
+
+    /// Runs a one-time global dedup pass across every in-scope merge-on-read
+    /// table, removing backlog-move strandings that per-partition compaction
+    /// cannot resolve.
+    ///
+    /// Acquires a DuckDB connection from the pool, then delegates to
+    /// [`crate::ducklake::compaction::run_merge_on_read_global_dedup`]. If the
+    /// merge-on-read scope is empty the call is a no-op.
+    pub async fn run_merge_on_read_cutover_dedup(&self) -> EtlResult<()> {
+        let tables = self.merge_on_read_scope.tables();
+        if tables.is_empty() {
+            return Ok(());
+        }
+        self.run_duckdb_blocking(move |conn| {
+            crate::ducklake::compaction::run_merge_on_read_global_dedup(conn, &tables)
+        })
+        .await
+    }
+
     /// Truncates the destination table while keeping its schema and name.
     async fn truncate_table_inner(
         &self,
