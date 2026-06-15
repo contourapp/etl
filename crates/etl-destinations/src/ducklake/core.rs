@@ -942,6 +942,7 @@ where
         abort_on_timeout: bool,
         store: S,
         tables: HashMap<String, crate::ducklake::schema::TableStorageConfig>,
+        merge_on_read_tables: Vec<String>,
     ) -> EtlResult<Self> {
         Self::new_with_external_maintenance(
             catalog_url,
@@ -956,7 +957,7 @@ where
             DuckLakeExternalMaintenanceConfig::default(),
             store,
             tables,
-            vec![],
+            merge_on_read_tables,
         )
         .await
     }
