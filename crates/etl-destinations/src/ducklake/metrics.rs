@@ -51,6 +51,11 @@ pub(crate) const ETL_DUCKLAKE_INLINE_FLUSH_DURATION_SECONDS: &str =
 pub(crate) const ETL_DUCKLAKE_RETRIES_TOTAL: &str = "etl_ducklake_retries_total";
 pub(crate) const ETL_DUCKLAKE_FAILED_BATCHES_TOTAL: &str = "etl_ducklake_failed_batches_total";
 pub(crate) const ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL: &str = "etl_ducklake_replayed_batches_total";
+/// Counts per-record fallbacks taken while draining the DEFAULT-replica-identity
+/// backlog through the merge-on-read append path during cutover. Should trend to
+/// zero once the source table is switched to `REPLICA IDENTITY FULL`.
+pub(crate) const ETL_DUCKLAKE_BACKLOG_FALLBACKS_TOTAL: &str =
+    "etl_ducklake_backlog_fallbacks_total";
 pub(crate) const ETL_DUCKLAKE_EXTERNAL_MAINTENANCE_PAUSE_DURATION_SECONDS: &str =
     "etl_ducklake_external_maintenance_pause_duration_seconds";
 pub(crate) const ETL_DUCKLAKE_EXTERNAL_MAINTENANCE_PAUSE_ACTIVE: &str =
@@ -89,6 +94,7 @@ pub(crate) const TABLE_LABEL: &str = "table";
 pub(crate) const SUB_BATCH_KIND_LABEL: &str = "sub_batch_kind";
 pub(crate) const PREPARED_ROWS_KIND_LABEL: &str = "prepared_rows_kind";
 pub(crate) const DELETE_ORIGIN_LABEL: &str = "delete_origin";
+pub(crate) const BACKLOG_FALLBACK_KIND_LABEL: &str = "fallback_kind";
 pub(crate) const RETRY_SCOPE_LABEL: &str = "retry_scope";
 pub(crate) const MAINTENANCE_OPERATION_LABEL: &str = "operation";
 pub(crate) const MAINTENANCE_REASON_LABEL: &str = "reason";
@@ -226,6 +232,13 @@ pub(crate) fn register_metrics() {
             Unit::Count,
             "DuckLake batches skipped because an applied marker already existed, labeled by \
              batch_kind."
+        );
+        describe_counter!(
+            ETL_DUCKLAKE_BACKLOG_FALLBACKS_TOTAL,
+            Unit::Count,
+            "Per-record fallbacks taken while draining the DEFAULT-replica-identity backlog \
+             through the merge-on-read append path, labeled by fallback_kind. Trends to zero \
+             after the source switches to REPLICA IDENTITY FULL."
         );
         describe_histogram!(
             ETL_DUCKLAKE_EXTERNAL_MAINTENANCE_PAUSE_DURATION_SECONDS,

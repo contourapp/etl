@@ -52,14 +52,16 @@ use crate::{
         core::is_create_table_conflict,
         encoding::{cell_to_sql_literal_ref, table_row_to_sql_literal_ref},
         metrics::{
-            BATCH_KIND_LABEL, DELETE_ORIGIN_LABEL, ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS,
+            BACKLOG_FALLBACK_KIND_LABEL, BATCH_KIND_LABEL, DELETE_ORIGIN_LABEL,
+            ETL_DUCKLAKE_BACKLOG_FALLBACKS_TOTAL, ETL_DUCKLAKE_BATCH_COMMIT_DURATION_SECONDS,
             ETL_DUCKLAKE_BATCH_PREPARED_MUTATIONS, ETL_DUCKLAKE_DELETE_PREDICATES,
             ETL_DUCKLAKE_FAILED_BATCHES_TOTAL, ETL_DUCKLAKE_REPLAYED_BATCHES_TOTAL,
             ETL_DUCKLAKE_RETRIES_TOTAL, ETL_DUCKLAKE_UPSERT_ROWS, PREPARED_ROWS_KIND_LABEL,
             RETRY_SCOPE_LABEL, SUB_BATCH_KIND_LABEL,
         },
         merge_on_read::{
-            EFFECTIVE_AT_LOCAL_COLUMN, MergeOnReadScope, build_tombstone_image, expand_key_row,
+            DEDUP_ORDER_BY, EFFECTIVE_AT_LOCAL_COLUMN, ETL_DELETED_COLUMN, ETL_VERSION_COLUMN,
+            ETL_VERSION_SQL_TYPE, MergeOnReadScope, build_tombstone_image, expand_key_row,
             is_partition_move, version_u128,
         },
         sql::{qualified_lake_table_name, quote_identifier},
@@ -199,6 +201,35 @@ enum PreparedTableMutation {
     /// same version, and both rows must survive.
     Append {
         rows: PreparedRows,
+    },
+    /// Merge-on-read read-before-write append for the DEFAULT-replica-identity
+    /// backlog (Task 19).
+    ///
+    /// A backlog `Update` carrying a `Partial` (unchanged-TOAST) new row plus a
+    /// key-only old row cannot be reconstructed at prepare time — there is no
+    /// full old image to overlay onto, and the build phase has no DuckDB
+    /// connection. This variant defers reconstruction to apply time: it reads
+    /// the prior live image for the row's identity from the lake (the production
+    /// dedup), overlays the partial's changed columns onto it, and appends the
+    /// reconstructed full image with the CDC columns.
+    ///
+    /// The whole reconstruct runs in one SQL statement so no DuckDB row ever has
+    /// to be decoded back into a `Cell`: present (changed) columns are emitted as
+    /// SQL literals, missing columns are selected from the prior-image subquery.
+    AppendReconstruct {
+        /// Quoted user column names plus the two trailing CDC columns, in the
+        /// target's INSERT column order.
+        insert_columns: Vec<String>,
+        /// Per-user-column SELECT expression: a literal for a present column, or
+        /// `prior.<col>` for a column missing from the partial. Trailing CDC
+        /// columns are appended by the apply arm.
+        user_select_exprs: Vec<String>,
+        /// `WHERE` predicate selecting the row's replica-identity in the target.
+        id_predicate: String,
+        /// Quoted identity columns used as the dedup `PARTITION BY` key.
+        partition_columns: Vec<String>,
+        /// Packed CDC version written to the reconstructed image.
+        version: u128,
     },
     /// MERGE INTO: hash-join against target for Replace/Update mutations.
     Merge {
@@ -1409,10 +1440,21 @@ fn prepare_append_mutations(
             }
             TableMutation::Delete(delete_row) => {
                 if partitioned {
-                    let old_full = delete_row.into_full().ok_or_else(|| {
-                        append_requires_full_old_row(replicated_table_schema, "delete")
-                    })?;
-                    push_append!(vec![build_tombstone_image(old_full)], version, true);
+                    // The partitioned tombstone needs the old partition key. A
+                    // full old row carries it; a key-only backlog delete does
+                    // not, so we fall back to the destructive scan-based DELETE
+                    // (which removes every version of the id — correct, the row
+                    // is gone and merge-on-read then has nothing to merge).
+                    if delete_row.as_full().is_some() {
+                        let old_full = delete_row.into_full().expect("as_full just matched");
+                        push_append!(vec![build_tombstone_image(old_full)], version, true);
+                    } else {
+                        record_backlog_fallback("delete");
+                        prepared_mutations.push(backlog_destructive_delete(
+                            replicated_table_schema,
+                            &delete_row,
+                        )?);
+                    }
                 } else {
                     let key_row = delete_row.into_key().ok_or_else(|| {
                         // A partitioned-table delete would carry a Full row; an
@@ -1429,37 +1471,69 @@ fn prepare_append_mutations(
                 }
             }
             TableMutation::Update { delete_row, new_row } => {
-                // Reconstruct the complete new image. Under REPLICA IDENTITY
-                // FULL a Partial new row (unchanged-TOAST) is recoverable by
-                // overlaying its changed columns onto the full old row.
-                let new_full = reconstruct_full_new_row(
-                    replicated_table_schema,
-                    &delete_row,
-                    new_row,
-                    &column_schemas,
-                )?;
-
-                if partitioned {
-                    let eff_idx = eff_idx.ok_or_else(|| {
-                        etl_error!(
-                            ErrorKind::InvalidState,
-                            "DuckLake merge-on-read partitioned table missing effective_at_local",
-                            format!("table '{}'", replicated_table_schema.name())
-                        )
-                    })?;
-                    let old_full = delete_row.into_full().ok_or_else(|| {
-                        // Task 19 adds the key-only backlog fallback.
-                        append_requires_full_old_row(replicated_table_schema, "update")
-                    })?;
-                    // Borrow-based move check BEFORE moving old_full into the
-                    // tombstone image.
-                    let moved = is_partition_move(&old_full, &new_full, eff_idx);
-                    if moved {
-                        push_append!(vec![build_tombstone_image(old_full)], version, true);
+                // Post-cutover (REPLICA IDENTITY FULL) every update carries a
+                // full old row, so the normal Task 6 paths run. The
+                // DEFAULT-identity backlog instead carries a key-only old row;
+                // those branches drain through the per-record fallback.
+                match delete_row.as_full() {
+                    Some(_) => {
+                        let new_full = reconstruct_full_new_row(
+                            replicated_table_schema,
+                            &delete_row,
+                            new_row,
+                            &column_schemas,
+                        )?;
+                        if partitioned {
+                            let eff_idx = eff_idx.ok_or_else(|| {
+                                etl_error!(
+                                    ErrorKind::InvalidState,
+                                    "DuckLake merge-on-read partitioned table missing \
+                                     effective_at_local",
+                                    format!("table '{}'", replicated_table_schema.name())
+                                )
+                            })?;
+                            let old_full = delete_row.into_full().ok_or_else(|| {
+                                append_requires_full_old_row(replicated_table_schema, "update")
+                            })?;
+                            // Borrow-based move check BEFORE moving old_full into
+                            // the tombstone image.
+                            let moved = is_partition_move(&old_full, &new_full, eff_idx);
+                            if moved {
+                                push_append!(
+                                    vec![build_tombstone_image(old_full)],
+                                    version,
+                                    true
+                                );
+                            }
+                            push_append!(vec![new_full], version, false);
+                        } else {
+                            push_append!(vec![new_full], version, false);
+                        }
                     }
-                    push_append!(vec![new_full], version, false);
-                } else {
-                    push_append!(vec![new_full], version, false);
+                    None => match new_row {
+                        // Key-only Full update: append the live new image. We
+                        // intentionally emit NO move-tombstone — without the old
+                        // effective_at_local we cannot detect a move, and the rare
+                        // backlog-move stranding is cleaned by the cutover
+                        // global-dedup pass.
+                        UpdatedTableRow::Full(new_full) => {
+                            record_backlog_fallback("full_update");
+                            push_append!(vec![new_full], version, false);
+                        }
+                        // Key-only Partial update (unchanged-TOAST): the full
+                        // image cannot be reconstructed at prepare time. Defer to
+                        // an apply-time read-before-write against the lake.
+                        UpdatedTableRow::Partial(partial) => {
+                            record_backlog_fallback("partial_reconstruct");
+                            prepared_mutations.push(prepare_append_reconstruct(
+                                replicated_table_schema,
+                                &delete_row,
+                                partial,
+                                &column_schemas,
+                                version,
+                            )?);
+                        }
+                    },
                 }
             }
         }
@@ -1468,14 +1542,130 @@ fn prepare_append_mutations(
     Ok(prepared_mutations)
 }
 
+/// Records one key-only backlog fallback for observability.
+///
+/// `kind` is one of `"delete"`, `"full_update"`, `"partial_reconstruct"`. The
+/// counter trends to zero once the source table is switched to
+/// `REPLICA IDENTITY FULL`, confirming the DEFAULT-identity backlog has drained.
+fn record_backlog_fallback(kind: &'static str) {
+    counter!(
+        ETL_DUCKLAKE_BACKLOG_FALLBACKS_TOTAL,
+        BACKLOG_FALLBACK_KIND_LABEL => kind,
+    )
+    .increment(1);
+    debug!(
+        target: "etl::ducklake::merge_on_read::backlog_fallback",
+        fallback_kind = kind,
+        "merge-on-read key-only backlog fallback"
+    );
+}
+
+/// Builds the destructive scan-based DELETE used to drain a key-only backlog
+/// delete on an in-scope table.
+///
+/// The merge-on-read tombstone append needs the old partition key, which a
+/// key-only old row lacks. Instead this removes every version of the row's
+/// identity from the target with the existing one-time, bounded
+/// [`apply_delete_mutation`] path. Read-side dedup then has nothing to merge for
+/// that id, which is correct: the row is gone.
+fn backlog_destructive_delete(
+    replicated_table_schema: &ReplicatedTableSchema,
+    delete_row: &OldTableRow,
+) -> EtlResult<PreparedTableMutation> {
+    let identity_column_schemas: Vec<_> =
+        replicated_table_schema.identity_column_schemas().cloned().collect();
+    let key_cells = replica_identity_key_cells(replicated_table_schema, delete_row)?;
+    Ok(PreparedTableMutation::Delete {
+        key_specs: build_staging_specs(&identity_column_schemas)?,
+        key_rows: prepare_rows(vec![TableRow::new(key_cells)], &identity_column_schemas)?,
+        origin: "backlog",
+    })
+}
+
+/// Builds the apply-time read-before-write reconstruct mutation for a key-only
+/// backlog `Update` carrying a `Partial` (unchanged-TOAST) new row.
+///
+/// The full image cannot be assembled at prepare time (there is no full old row
+/// to overlay onto, and the build phase has no DuckDB connection), so the
+/// reconstruction is encoded as SQL pieces resolved at apply time: present
+/// (changed) columns become SQL literals, missing columns are selected from the
+/// prior live image of the row's identity. See
+/// [`PreparedTableMutation::AppendReconstruct`].
+fn prepare_append_reconstruct(
+    replicated_table_schema: &ReplicatedTableSchema,
+    delete_row: &OldTableRow,
+    partial: PartialTableRow,
+    column_schemas: &[ColumnSchema],
+    version: u128,
+) -> EtlResult<PreparedTableMutation> {
+    let total_columns = column_schemas.len();
+    if partial.total_columns() != total_columns {
+        return Err(etl_error!(
+            ErrorKind::InvalidState,
+            "DuckLake merge-on-read partial row width does not match schema",
+            format!(
+                "table '{}' partial declared {} columns, schema has {total_columns}",
+                replicated_table_schema.name(),
+                partial.total_columns()
+            )
+        ));
+    }
+
+    let (present, missing_indexes) = partial.into_parts();
+    let missing: std::collections::HashSet<usize> = missing_indexes.into_iter().collect();
+    let mut present_iter = present.into_values().into_iter();
+
+    // One SELECT expression per user column, in replicated table-column order:
+    // a missing column is read from the prior image; a present column becomes a
+    // SQL literal of its new value.
+    let mut user_select_exprs = Vec::with_capacity(total_columns);
+    for (index, column) in column_schemas.iter().enumerate() {
+        if missing.contains(&index) {
+            user_select_exprs.push(format!("prior.{}", quote_identifier(&column.name)));
+        } else {
+            let cell = present_iter.next().ok_or_else(|| {
+                etl_error!(
+                    ErrorKind::InvalidState,
+                    "DuckLake merge-on-read partial row missing a present value",
+                    format!(
+                        "table '{}' partial ran out of present values at column {index}",
+                        replicated_table_schema.name()
+                    )
+                )
+            })?;
+            user_select_exprs.push(cell_to_sql_literal_ref(&cell));
+        }
+    }
+
+    let id_predicate = delete_predicate_from_row(replicated_table_schema, delete_row)?;
+
+    let partition_columns: Vec<String> = replicated_table_schema
+        .identity_column_schemas()
+        .map(|c| quote_identifier(&c.name).to_string())
+        .collect();
+
+    let mut insert_columns: Vec<String> =
+        column_schemas.iter().map(|c| quote_identifier(&c.name).to_string()).collect();
+    insert_columns.push(quote_identifier(ETL_VERSION_COLUMN).to_string());
+    insert_columns.push(quote_identifier(ETL_DELETED_COLUMN).to_string());
+
+    Ok(PreparedTableMutation::AppendReconstruct {
+        insert_columns,
+        user_select_exprs,
+        id_predicate,
+        partition_columns,
+        version,
+    })
+}
+
 /// Reconstructs the complete new row image for a merge-on-read update.
 ///
 /// A `Full` new row is used directly. A `Partial` new row (unchanged-TOAST under
 /// REPLICA IDENTITY FULL) is rebuilt by overlaying its present columns onto the
 /// full old row: missing replicated-column positions take the old row's value,
-/// the rest take the partial's present values in order. If the old row is not a
-/// full image, reconstruction is impossible and an error is returned (Task 19
-/// adds the key-only / read-before-write fallback).
+/// the rest take the partial's present values in order. Callers only reach this
+/// after a full-old-row guard; the key-only backlog `Partial` case is instead
+/// handled by [`prepare_append_reconstruct`] (apply-time read-before-write).
 fn reconstruct_full_new_row(
     replicated_table_schema: &ReplicatedTableSchema,
     delete_row: &OldTableRow,
@@ -1538,7 +1728,13 @@ fn overlay_partial_on_full(
 }
 
 /// Builds the error returned when an append-only mutation needs the full old
-/// row image but only a key-only image is available (pre-cutover backlog).
+/// row image but only a key-only image is available.
+///
+/// After Task 19, key-only old rows are drained by the per-record backlog
+/// fallback (see [`prepare_append_mutations`]), so this is only reached on the
+/// genuinely-unreachable defensive paths guarded by a prior `as_full()` match —
+/// it exists to fail loudly should that invariant ever be broken rather than
+/// write an incomplete image.
 fn append_requires_full_old_row(
     replicated_table_schema: &ReplicatedTableSchema,
     origin: &str,
@@ -1547,8 +1743,8 @@ fn append_requires_full_old_row(
         ErrorKind::SourceReplicaIdentityError,
         "DuckLake merge-on-read append requires a full old row image",
         format!(
-            "table '{}' {origin} carried a key-only old row; REPLICA IDENTITY FULL is required \
-             (key-only backlog fallback is deferred to a later task)",
+            "table '{}' {origin} carried a key-only old row after the full-row guard; this is an \
+             internal invariant violation",
             replicated_table_schema.name()
         )
     )
@@ -2433,6 +2629,21 @@ fn apply_table_mutation(
             .record(rows.row_count() as f64);
             apply_upsert_mutation(conn, rows, reusable_staging_table)
         }
+        PreparedTableMutation::AppendReconstruct {
+            insert_columns,
+            user_select_exprs,
+            id_predicate,
+            partition_columns,
+            version,
+        } => apply_append_reconstruct(
+            conn,
+            &reusable_staging_table.table_name,
+            insert_columns,
+            user_select_exprs,
+            id_predicate,
+            partition_columns,
+            *version,
+        ),
         PreparedTableMutation::Merge { rows, identity_columns, all_columns } => {
             histogram!(
                 ETL_DUCKLAKE_UPSERT_ROWS,
@@ -2456,6 +2667,69 @@ fn apply_upsert_mutation(
     }
 
     reusable_staging_table.stage_and_insert(conn, prepared_rows)
+}
+
+/// Applies one merge-on-read read-before-write reconstruct inside an open
+/// DuckLake transaction (Task 19, key-only backlog `Partial` update).
+///
+/// Reads the prior live image of the row's identity from the target with the
+/// production dedup, overlays the partial's changed columns (already encoded as
+/// literals in `user_select_exprs`) onto the missing columns (read from the
+/// prior image), and appends the reconstructed full image with the CDC columns —
+/// all in one `INSERT ... SELECT` so no DuckDB row is decoded back into a `Cell`.
+///
+/// If no prior live image exists the statement inserts zero rows; that should be
+/// impossible (the insert precedes the update in LSN order), so we fail loudly
+/// rather than silently write a partial image.
+fn apply_append_reconstruct(
+    conn: &duckdb::Connection,
+    table_name: &str,
+    insert_columns: &[String],
+    user_select_exprs: &[String],
+    id_predicate: &str,
+    partition_columns: &[String],
+    version: u128,
+) -> EtlResult<()> {
+    let target_table = qualified_lake_table_name(table_name);
+    let insert_column_list = insert_columns.join(", ");
+    let partition_by = partition_columns.join(", ");
+    let deleted_column = quote_identifier(ETL_DELETED_COLUMN);
+    // Present columns are literals; missing columns reference `prior`. Append the
+    // two CDC columns: the packed version and a live (`false`) tombstone flag.
+    let select_list = format!(
+        "{}, CAST({version} AS {ETL_VERSION_SQL_TYPE}), FALSE",
+        user_select_exprs.join(", ")
+    );
+    let sql = format!(
+        "INSERT INTO {target_table} ({insert_column_list}) \
+         SELECT {select_list} FROM ( \
+           SELECT * FROM {target_table} WHERE {id_predicate} \
+           QUALIFY ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY {DEDUP_ORDER_BY}) = 1 \
+             AND NOT {deleted_column} \
+         ) AS prior;"
+    );
+
+    let affected = conn.execute(&sql, []).map_err(|err| {
+        tracing::error!(error = %DuckDbSensitiveQueryError, "error reconstruct INSERT");
+        etl_error!(
+            ErrorKind::DestinationQueryFailed,
+            "DuckLake merge-on-read reconstruct INSERT failed",
+            format_query_error_detail(&sql),
+            source: err
+        )
+    })?;
+
+    if affected == 0 {
+        return Err(etl_error!(
+            ErrorKind::InvalidState,
+            "DuckLake merge-on-read reconstruct found no prior image",
+            format!(
+                "table '{table_name}' key-only Partial backlog update found no prior live image \
+                 to reconstruct from; the row's insert should precede its update in LSN order"
+            )
+        ));
+    }
+    Ok(())
 }
 
 /// Deduplicates staging table then plain INSERT (no hash-join against target).
@@ -2758,7 +3032,9 @@ fn apply_sub_batch_rows(batch: &PreparedDuckLakeTableBatch) -> Option<usize> {
         PreparedTableMutation::Append { rows }
         | PreparedTableMutation::DedupedUpsert { rows, .. }
         | PreparedTableMutation::Merge { rows, .. } => Some(rows.row_count()),
-        PreparedTableMutation::Delete { .. } | PreparedTableMutation::Update { .. } => None,
+        PreparedTableMutation::Delete { .. }
+        | PreparedTableMutation::Update { .. }
+        | PreparedTableMutation::AppendReconstruct { .. } => None,
     }
 }
 
@@ -3976,8 +4252,11 @@ mod merge_on_read_apply_tests {
         assert_eq!(score_col.value(0), 0, "non-nullable INT4 column expanded to zero");
     }
 
+    /// Task 19: a key-only DEFAULT-identity backlog delete on a partitioned
+    /// in-scope table no longer errors. It falls back to the destructive
+    /// scan-based `Delete` (origin "backlog"), not an Append-tombstone.
     #[test]
-    fn key_only_old_row_on_partitioned_delete_errors() {
+    fn backlog_key_only_delete_falls_back_to_destructive_delete() {
         let schema = partitioned_schema();
         let specs = build_staging_specs_with_cdc(
             &schema.column_schemas().cloned().collect::<Vec<_>>(),
@@ -3989,11 +4268,137 @@ mod merge_on_read_apply_tests {
                 ID_A.to_owned(),
             )]))),
         )];
-        let err = match prepare_append_mutations(&schema, muts, true, &specs) {
-            Ok(_) => panic!("expected key-only delete to error"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::SourceReplicaIdentityError);
+        let ops = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(ops.len(), 1, "one destructive delete for the key-only backlog delete");
+        match &ops[0] {
+            PreparedTableMutation::Delete { key_rows, origin, .. } => {
+                assert_eq!(*origin, "backlog", "key-only backlog delete uses origin 'backlog'");
+                assert_eq!(key_rows.row_count(), 1, "one staged identity key");
+            }
+            _ => panic!("expected a destructive Delete for the key-only backlog delete"),
+        }
+    }
+
+    /// Task 19: a key-only DEFAULT-identity backlog `Update(Full)` appends the
+    /// live new image and emits NO tombstone, even on a partitioned table (we
+    /// cannot detect a move without the old effective_at_local).
+    #[test]
+    fn backlog_key_only_full_update_appends_live_image_no_tombstone() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![tracked(
+            13,
+            TableMutation::Update {
+                delete_row: OldTableRow::Key(TableRow::new(vec![Cell::String(ID_A.to_owned())])),
+                new_row: UpdatedTableRow::Full(full_row("2026-07-02T00:00:00Z", "v2")),
+            },
+        )];
+        let ops = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(ops.len(), 1, "key-only Full update => exactly one live append, no tombstone");
+        let (_, deleted) = append_cdc(&ops[0]);
+        assert!(!deleted, "the single append is the live new image");
+    }
+
+    /// Task 19 end-to-end: a key-only DEFAULT-identity backlog `Update(Partial)`
+    /// (unchanged-TOAST) reconstructs its full image at apply time by reading the
+    /// prior live image from the lake. The appended row must carry the partial's
+    /// NEW value for the changed column AND the prior lake image's value for the
+    /// unchanged (missing) column.
+    #[test]
+    fn backlog_key_only_partial_update_reconstructs_from_lake() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        // Build the AppendReconstruct mutation: change `description` (idx 3),
+        // keep `debit` (idx 1) from the prior image. Present columns in
+        // replicated order, excluding the missing debit: id, eff, description.
+        let present = TableRow::new(vec![
+            Cell::String(ID_A.to_owned()),
+            ts("2026-05-20T00:00:00Z"),
+            Cell::String("new-desc".to_owned()),
+        ]);
+        let partial = PartialTableRow::new(4, present, vec![1]); // debit missing
+        let muts = vec![tracked(
+            7,
+            TableMutation::Update {
+                delete_row: OldTableRow::Key(TableRow::new(vec![Cell::String(ID_A.to_owned())])),
+                new_row: UpdatedTableRow::Partial(partial),
+            },
+        )];
+        let ops = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(ops.len(), 1, "key-only partial update => one AppendReconstruct");
+        let (insert_columns, user_select_exprs, id_predicate, partition_columns, version) =
+            match &ops[0] {
+                PreparedTableMutation::AppendReconstruct {
+                    insert_columns,
+                    user_select_exprs,
+                    id_predicate,
+                    partition_columns,
+                    version,
+                } => (insert_columns, user_select_exprs, id_predicate, partition_columns, *version),
+                _ => panic!("expected an AppendReconstruct for the key-only partial update"),
+            };
+
+        // Seed a target table with the prior live image (debit = 12.50,
+        // description = "prior-desc"), then apply the reconstruct. The target
+        // name resolves through qualified_lake_table_name, so create the `lake`
+        // schema and table to match the apply path exactly.
+        let table_name = "lines";
+        let target = qualified_lake_table_name(table_name);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET TimeZone = 'UTC';").unwrap();
+        conn.execute_batch(&format!("CREATE SCHEMA {};", quote_identifier(LAKE_CATALOG)))
+            .unwrap();
+        let target_ddl = specs
+            .iter()
+            .map(|s| format!("{} {}", quote_identifier(&s.name), s.staging_sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!("CREATE TABLE {target} ({target_ddl});")).unwrap();
+        // Prior live image at an earlier version (100).
+        conn.execute_batch(&format!(
+            "INSERT INTO {target} VALUES (\
+               CAST('{ID_A}' AS UUID), 12.50, TIMESTAMPTZ '2026-05-10 00:00:00+00', \
+               'prior-desc', CAST(100 AS {ETL_VERSION_SQL_TYPE}), FALSE);"
+        ))
+        .unwrap();
+
+        apply_append_reconstruct(
+            &conn,
+            table_name,
+            insert_columns,
+            user_select_exprs,
+            id_predicate,
+            partition_columns,
+            version,
+        )
+        .unwrap();
+
+        // Dedup to the latest version and confirm reconstruction.
+        let (debit, desc, deleted): (f64, String, bool) = conn
+            .query_row(
+                &format!(
+                    "SELECT \"debit\"::DOUBLE, \"description\", \"_etl_deleted\" FROM (\
+                       SELECT * FROM {target} \
+                       QUALIFY ROW_NUMBER() OVER (PARTITION BY \"id\" \
+                         ORDER BY \"_etl_version\" DESC, \"_etl_deleted\" ASC) = 1)"
+                ),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(!deleted, "reconstructed image is live");
+        assert_eq!(desc, "new-desc", "changed column carries the partial's NEW value");
+        assert!(
+            (debit - 12.50).abs() < 1e-9,
+            "unchanged column carries the prior lake image's value (read-before-write), got {debit}"
+        );
     }
 
     /// Builds the cdc-augmented target table DDL, stages every produced append,
