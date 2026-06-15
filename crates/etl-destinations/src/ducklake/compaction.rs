@@ -10,7 +10,7 @@ use super::merge_on_read::DEDUP_ORDER_BY;
 ///
 /// The QUALIFY window keeps the highest-version row per `id`; a tombstone
 /// surviving as the winner causes its entire group to be dropped (because of
-/// the `WHERE NOT _etl_deleted` on the INSERT). This is the full-table form —
+/// the `WHERE _etl_deleted IS NOT TRUE` on the INSERT). This is the full-table form —
 /// callers that need incrementality must add their own scoping on top.
 fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     let sql_begin = "BEGIN TRANSACTION";
@@ -21,7 +21,7 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     );
     let sql_delete = format!("DELETE FROM {table};");
     let sql_insert = format!(
-        "INSERT INTO {table} SELECT * FROM _keep WHERE NOT _etl_deleted;"
+        "INSERT INTO {table} SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE;"
     );
     let sql_commit = "COMMIT";
 
@@ -100,7 +100,7 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
 /// 1. `CREATE OR REPLACE TEMP TABLE _keep AS SELECT * QUALIFY …` — snapshot
 ///    winners without touching the target.
 /// 2. `DELETE FROM <table>` — physically clear every row.
-/// 3. `INSERT INTO <table> SELECT * FROM _keep WHERE NOT _etl_deleted` —
+/// 3. `INSERT INTO <table> SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE` —
 ///    write back only live survivors.
 ///
 /// # TODO: scope to recently-written partitions for incrementality
@@ -381,5 +381,62 @@ mod compaction_tests {
             .query_row("SELECT COUNT(*) FROM t2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(t2_total, 1, "t2: exactly one live row survives");
+    }
+
+    #[test]
+    fn compaction_keeps_null_base_generation_rows() {
+        // Regression guard for the in-place cutover data-loss bug.
+        //
+        // After ADD COLUMN IF NOT EXISTS, pre-migration "base generation" rows have
+        // NULL _etl_version and NULL _etl_deleted. The old `WHERE NOT _etl_deleted`
+        // filter treated NULL as falsy (NOT NULL = NULL, not TRUE) and dropped every
+        // base row. The fix uses `_etl_deleted IS NOT TRUE` which preserves NULL rows.
+        //
+        // Two scenarios:
+        //   id=1: pure base row (NULL version, NULL deleted) — must survive compaction.
+        //   id=2: base row (NULL version, NULL deleted) PLUS a later live append
+        //          (real version, deleted=false) — the append must win (NULLS LAST
+        //          in ORDER BY causes the base row to sort after the real version),
+        //          and the surviving row must carry the append's credit value.
+        let conn = open();
+        setup(&conn);
+
+        conn.execute_batch(
+            "INSERT INTO t (id, credit, _etl_version, _etl_deleted) VALUES
+               (1, 10, NULL, NULL),
+               (2, 20, NULL, NULL),
+               (2, 25, 1,    false);",
+        )
+        .unwrap();
+
+        compact_partition(&conn, "t").unwrap();
+
+        // id=1: pure base row must survive (not dropped by IS NOT TRUE filter).
+        let id1_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id1_count, 1, "id=1: pure base-generation row must survive compaction");
+
+        let id1_credit: i32 = conn
+            .query_row("SELECT credit FROM t WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id1_credit, 10, "id=1: base-generation row must retain its original value");
+
+        // id=2: real append (v1, deleted=false) wins over base NULL row via NULLS LAST;
+        // only one row survives and it carries the append's credit (25, not 20).
+        let id2_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id2_count, 1, "id=2: exactly one row survives when base and append coexist");
+
+        let id2_credit: i32 = conn
+            .query_row("SELECT credit FROM t WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id2_credit, 25, "id=2: real append must win over base-generation row (NULLS LAST)");
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "two rows survive: one pure base (id=1) and one real append (id=2)");
     }
 }

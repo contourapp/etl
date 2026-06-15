@@ -2734,7 +2734,7 @@ fn apply_append_reconstruct(
          SELECT {select_list} FROM ( \
            SELECT * FROM {target_table} WHERE {id_predicate} \
            QUALIFY ROW_NUMBER() OVER (PARTITION BY {partition_by} ORDER BY {DEDUP_ORDER_BY}) = 1 \
-             AND NOT {deleted_column} \
+             AND {deleted_column} IS NOT TRUE \
          ) AS prior;"
     );
 

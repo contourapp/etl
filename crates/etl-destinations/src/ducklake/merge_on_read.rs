@@ -25,7 +25,7 @@ pub const ETL_VERSION_SQL_TYPE: &str = "UHUGEINT";
 /// Descending version picks the latest mutation; ascending deleted places
 /// non-deleted rows first among ties (so a live row beats an older tombstone
 /// if they somehow share a version).
-pub const DEDUP_ORDER_BY: &str = "_etl_version DESC, _etl_deleted ASC";
+pub const DEDUP_ORDER_BY: &str = "_etl_version DESC NULLS LAST, _etl_deleted ASC";
 
 /// Packs `(commit_lsn, tx_ordinal)` into a monotone `u128` version key.
 ///
