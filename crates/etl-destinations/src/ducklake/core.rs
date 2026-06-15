@@ -72,7 +72,8 @@ use crate::{
             resolve_ducklake_metadata_schema_blocking, spawn_ducklake_metrics_sampler,
         },
         schema::{
-            build_add_column_sql_ducklake, build_create_table_sql_ducklake,
+            build_add_cdc_columns_sql, build_add_column_sql_ducklake,
+            build_create_table_sql_ducklake, build_create_table_sql_with_cdc,
             build_drop_column_sql_ducklake, build_rename_column_sql_ducklake,
         },
         sql::qualified_lake_table_name,
@@ -177,8 +178,6 @@ pub struct DuckLakeDestination<S> {
     /// default once streaming writes began.
     streaming_inlining_restored: Arc<Mutex<HashSet<DuckLakeTableName>>>,
     /// Predicate identifying which tables use merge-on-read CDC semantics.
-    /// Consumed by later tasks; stored here so it travels with the destination.
-    #[allow(dead_code)]
     merge_on_read_scope: MergeOnReadScope,
 }
 
@@ -2254,7 +2253,12 @@ where
         replicated_table_schema: &ReplicatedTableSchema,
     ) -> EtlResult<()> {
         let column_schemas: Vec<_> = replicated_table_schema.column_schemas().cloned().collect();
-        let ddl = build_create_table_sql_ducklake(table_name, &column_schemas);
+        let is_in_scope = self.merge_on_read_scope.contains(table_name);
+        let ddl = if is_in_scope {
+            build_create_table_sql_with_cdc(table_name, &column_schemas)
+        } else {
+            build_create_table_sql_ducklake(table_name, &column_schemas)
+        };
         let created_tables = Arc::clone(&self.created_tables);
         let table_name = table_name.to_owned();
         let storage_config = self.table_storage_config.get(&table_name).cloned();
@@ -2284,6 +2288,23 @@ where
                         )
                     })?;
                 if already_exists {
+                    // For in-scope tables that predate this feature, add the CDC
+                    // columns idempotently. `ADD COLUMN IF NOT EXISTS` is a no-op
+                    // when the columns already exist, so this is safe to replay.
+                    // The `created_tables` cache guarantees this runs only once
+                    // per process start (first-ensure), not on every batch.
+                    if is_in_scope {
+                        let qualified = qualified_lake_table_name(&table_name);
+                        let alter_sql = build_add_cdc_columns_sql(&qualified);
+                        conn.execute_batch(&alter_sql).map_err(|error| {
+                            etl_error!(
+                                ErrorKind::DestinationQueryFailed,
+                                "DuckLake add CDC columns failed",
+                                format_query_error_detail(&alter_sql),
+                                source: error
+                            )
+                        })?;
+                    }
                     created_tables.lock().insert(table_name.clone());
                     debug!(table = %table_name, "ducklake table already exists, skipping DDL");
                     return Ok(());

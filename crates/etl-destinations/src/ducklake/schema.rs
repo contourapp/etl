@@ -133,8 +133,6 @@ pub(super) fn build_create_table_sql_ducklake(
 ///
 /// Both columns are nullable so existing rows written before CDC was enabled
 /// do not require a rewrite — NULL version = base generation, NULL deleted = live.
-// Consumed by Task 17 (wiring into the create/ensure path).
-#[allow(dead_code)]
 pub(super) fn build_create_table_sql_with_cdc(
     table_name: &str,
     column_schemas: &[ColumnSchema],
@@ -156,8 +154,6 @@ pub(super) fn build_create_table_sql_with_cdc(
 ///
 /// Both columns are added as nullable so existing rows need no backfill.
 /// `IF NOT EXISTS` makes the statements safe to replay.
-// Consumed by Task 17 (wiring into the create/ensure path).
-#[allow(dead_code)]
 pub(super) fn build_add_cdc_columns_sql(qualified_table: &str) -> String {
     format!(
         "ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {v} {vt};\nALTER TABLE {t} ADD COLUMN IF NOT EXISTS {d} BOOLEAN;",
@@ -337,6 +333,43 @@ mod tests {
         );
 
         assert_eq!(sql, r#"alter table "lake"."test_table" add column "score" integer"#);
+    }
+
+    /// Simulates the routing in `issue_create_table_stmt`: in-scope tables use
+    /// the CDC variant; out-of-scope tables use the plain variant.
+    fn select_create_ddl(table_name: &str, is_in_scope: bool, cols: &[ColumnSchema]) -> String {
+        if is_in_scope {
+            build_create_table_sql_with_cdc(table_name, cols)
+        } else {
+            build_create_table_sql_ducklake(table_name, cols)
+        }
+    }
+
+    #[test]
+    fn in_scope_create_includes_cdc_columns() {
+        let cols = sample_line_columns();
+        let sql = select_create_ddl("public_lines", true, &cols);
+        assert!(sql.contains("\"_etl_version\" UHUGEINT"), "sql: {sql}");
+        assert!(sql.contains("\"_etl_deleted\" BOOLEAN"), "sql: {sql}");
+    }
+
+    #[test]
+    fn out_of_scope_create_excludes_cdc_columns() {
+        let cols = sample_line_columns();
+        let sql = select_create_ddl("public_dimension__values", false, &cols);
+        assert!(!sql.contains("_etl_version"), "sql: {sql}");
+        assert!(!sql.contains("_etl_deleted"), "sql: {sql}");
+    }
+
+    #[test]
+    fn add_cdc_sql_uses_qualified_lake_table_name() {
+        let qualified = qualified_lake_table_name("public_lines");
+        let sql = build_add_cdc_columns_sql(&qualified);
+        assert!(
+            sql.contains("\"lake\".\"public_lines\""),
+            "alter should target the qualified lake table: {sql}"
+        );
+        assert!(sql.contains("ADD COLUMN IF NOT EXISTS"), "sql: {sql}");
     }
 
     #[test]
