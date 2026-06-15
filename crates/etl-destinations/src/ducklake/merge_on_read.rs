@@ -1,14 +1,10 @@
 use std::collections::HashSet;
 
 use chrono::Datelike;
-// Consumed by later tasks (schema column construction, compaction SQL, etc.).
-#[allow(dead_code)]
 use etl::types::{EventSequenceKey, PgLsn};
 use etl::types::{ArrayCell, Cell, ReplicatedTableSchema, TableRow, Type, is_array_type};
 
 /// Column name for the packed CDC version written to every merge-on-read row.
-// Consumed by later tasks (schema column construction, compaction SQL, etc.).
-#[allow(dead_code)]
 pub const ETL_VERSION_COLUMN: &str = "_etl_version";
 
 /// Partition-key column on the partitioned in-scope fact tables
@@ -17,24 +13,18 @@ pub const ETL_VERSION_COLUMN: &str = "_etl_version";
 pub const EFFECTIVE_AT_LOCAL_COLUMN: &str = "effective_at_local";
 
 /// Column name for the boolean tombstone flag written on DELETE rows.
-// Consumed by later tasks (schema column construction, compaction SQL, etc.).
-#[allow(dead_code)]
 pub const ETL_DELETED_COLUMN: &str = "_etl_deleted";
 
 /// DuckDB SQL type used for the version column. UHUGEINT is a single 128-bit
 /// unsigned integer that preserves the natural u128 ordering produced by
 /// [`version_u128`], so `ORDER BY _etl_version DESC` correctly picks the
 /// most-recent row during merge-on-read deduplication.
-// Consumed by later tasks (schema column construction, compaction SQL, etc.).
-#[allow(dead_code)]
 pub const ETL_VERSION_SQL_TYPE: &str = "UHUGEINT";
 
 /// ORDER BY clause fragment used in deduplication queries and compaction views.
 /// Descending version picks the latest mutation; ascending deleted places
 /// non-deleted rows first among ties (so a live row beats an older tombstone
 /// if they somehow share a version).
-// Consumed by later tasks (schema column construction, compaction SQL, etc.).
-#[allow(dead_code)]
 pub const DEDUP_ORDER_BY: &str = "_etl_version DESC, _etl_deleted ASC";
 
 /// Packs `(commit_lsn, tx_ordinal)` into a monotone `u128` version key.
@@ -46,8 +36,6 @@ pub const DEDUP_ORDER_BY: &str = "_etl_version DESC, _etl_deleted ASC";
 /// The result is written to the `_etl_version` column (`UHUGEINT`) so that
 /// `ORDER BY _etl_version DESC` selects the most-recent row during
 /// merge-on-read deduplication.
-// Consumed by later tasks (appender / row encoding, etc.).
-#[allow(dead_code)]
 pub fn version_u128(commit_lsn: PgLsn, tx_ordinal: u64) -> u128 {
     EventSequenceKey::new(commit_lsn, tx_ordinal).as_u128()
 }

@@ -489,11 +489,10 @@ pub(super) fn prepare_rows_with_cdc(
 /// row.
 ///
 /// `version` is a packed `u128` (high 64 bits = commit_lsn, low 64 bits =
-/// tx_ordinal). Realistic values stay far below `i128::MAX`, so the cast is
+/// tx_ordinal). Realistic values stay far below i128::MAX (the true upper bound
+/// is the DECIMAL(38,0) storage maximum, ~10^38−1), so the i128 conversion is
 /// safe in practice. An explicit guard returns an `EtlResult` error on overflow
 /// rather than panicking, in case of future version-encoding changes.
-// Consumed by Task 6.
-#[allow(dead_code)]
 pub(super) fn build_record_batch_with_cdc(
     rows: &[TableRow],
     specs: &[StagingColumnSpec],
@@ -503,8 +502,8 @@ pub(super) fn build_record_batch_with_cdc(
     let version_i128 = i128::try_from(version).map_err(|_| {
         etl_error!(
             ErrorKind::ConversionError,
-            "CDC version overflows i128",
-            format!("version {version} does not fit in Decimal128(38,0)")
+            "CDC version overflows i128 (exceeds DECIMAL(38,0) storage range)",
+            format!("version {version} does not fit in i128; DECIMAL(38,0) max is ~10^38−1")
         )
     })?;
     let row_count = rows.len();

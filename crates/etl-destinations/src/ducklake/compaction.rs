@@ -86,11 +86,14 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
 /// Compacts the merge-on-read append log for `table`, collapsing multiple
 /// versioned rows per `id` down to at most one surviving live row.
 ///
-/// **Correctness model:** for each `id`, keep only the max-version row
-/// (tie-breaking `_etl_deleted ASC` so a live image beats a tombstone at equal
-/// version). If the surviving row is a tombstone, the entire `id` group is
-/// dropped — a deleted row vanishes; a moved-away partition row disappears while
-/// its live image survives in the new partition's own compaction pass.
+/// **Current behavior (full-table):** scans every row in `table` with a single
+/// `PARTITION BY id ORDER BY _etl_version DESC, _etl_deleted ASC` window,
+/// keeping only the highest-version row per `id` across all physical DuckLake
+/// partitions. Rows whose surviving image is a tombstone (`_etl_deleted = true`)
+/// are dropped entirely — the `id` disappears from the table. Because the
+/// deduplication crosses all partitions in one pass, a partition-move tombstone
+/// and its corresponding live image in a different partition are handled
+/// correctly: the higher-version image wins and the lower-version one is removed.
 ///
 /// **Implementation:** delegates to [`collapse_by_id`] which runs three
 /// statements inside one transaction:
@@ -101,10 +104,9 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
 ///    write back only live survivors.
 ///
 /// # TODO: scope to recently-written partitions for incrementality
-/// The current implementation is a full-table collapse, which is correct but
-/// O(table). A future incremental pass would identify recently-written
-/// DuckLake partitions via a watermark and restrict the DELETE + INSERT to
-/// those partition ranges, making the cost O(new data) rather than O(table).
+/// A future incremental pass would identify recently-written DuckLake partitions
+/// via a watermark and restrict the DELETE + INSERT to those partition ranges,
+/// making the cost O(new data) rather than O(table).
 ///
 /// # Errors
 /// Returns an `EtlError` wrapping the underlying `duckdb::Error` on any SQL

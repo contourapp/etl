@@ -25,7 +25,7 @@ use etl::{
     etl_error,
     types::{
         Cell, ColumnSchema, EventSequenceKey, OldTableRow, PartialTableRow, ReplicatedTableSchema,
-        TableRow, UpdatedTableRow,
+        TableRow, UpdatedTableRow, is_range_array_type, is_range_type,
     },
 };
 use metrics::{counter, histogram};
@@ -1456,17 +1456,17 @@ fn prepare_append_mutations(
                         )?);
                     }
                 } else {
-                    let key_row = delete_row.into_key().ok_or_else(|| {
-                        // A partitioned-table delete would carry a Full row; an
-                        // unpartitioned-table delete carries the key row. A Full
-                        // image here is unexpected for an unpartitioned table.
-                        etl_error!(
-                            ErrorKind::InvalidState,
-                            "DuckLake merge-on-read delete on unpartitioned table missing key row",
-                            format!("table '{}'", replicated_table_schema.name())
-                        )
-                    })?;
-                    let tombstone = expand_key_row(key_row, replicated_table_schema);
+                    // An unpartitioned in-scope table may send FULL old rows
+                    // (e.g. `observations` with REPLICA IDENTITY FULL). Both
+                    // shapes are valid tombstones: a Full image is used directly
+                    // (non-key columns are irrelevant for dedup-by-id but
+                    // harmless), while a key-only image is expanded to full width.
+                    let tombstone = match delete_row {
+                        OldTableRow::Full(row) => build_tombstone_image(row),
+                        OldTableRow::Key(key_row) => {
+                            expand_key_row(key_row, replicated_table_schema)
+                        }
+                    };
                     push_append!(vec![tombstone], version, true);
                 }
             }
@@ -1591,6 +1591,15 @@ fn backlog_destructive_delete(
 /// (changed) columns become SQL literals, missing columns are selected from the
 /// prior live image of the row's identity. See
 /// [`PreparedTableMutation::AppendReconstruct`].
+///
+/// **Limitation:** a present (changed) range-typed column (`tstzrange`,
+/// `int4range`, etc.) cannot be encoded here because `cell_to_sql_literal_ref`
+/// yields a plain VARCHAR literal while the target column is a DuckDB
+/// `STRUCT(...)`. This is a transitional gap — the backlog drains once
+/// `REPLICA IDENTITY FULL` is set and new deletes carry full old rows handled
+/// by the normal staging path. If a changed range column is encountered this
+/// function returns a descriptive `ConversionError` rather than producing a
+/// SQL type mismatch at apply time.
 fn prepare_append_reconstruct(
     replicated_table_schema: &ReplicatedTableSchema,
     delete_row: &OldTableRow,
@@ -1633,6 +1642,26 @@ fn prepare_append_reconstruct(
                     )
                 )
             })?;
+            // Range columns (tstzrange, int4range, etc.) are stored as DuckDB
+            // STRUCT types. A plain VARCHAR literal from `cell_to_sql_literal_ref`
+            // would cause a type mismatch at apply time. Unchanged range columns
+            // are safe (they read `prior.<col>`); only a *changed* range column
+            // is unsupported here — fail with a clear message rather than a
+            // cryptic SQL error.
+            if is_range_type(&column.typ) || is_range_array_type(&column.typ) {
+                return Err(etl_error!(
+                    ErrorKind::ConversionError,
+                    "merge-on-read backlog reconstruct cannot encode a changed range column",
+                    format!(
+                        "table '{}' column '{}' is a range type ({:?}); a changed range column \
+                         cannot be rendered as a SQL literal for AppendReconstruct — this \
+                         limitation resolves once REPLICA IDENTITY FULL is set and the backlog drains",
+                        replicated_table_schema.name(),
+                        column.name,
+                        column.typ
+                    )
+                ));
+            }
             user_select_exprs.push(cell_to_sql_literal_ref(&cell));
         }
     }
@@ -4252,6 +4281,46 @@ mod merge_on_read_apply_tests {
         assert_eq!(score_col.value(0), 0, "non-nullable INT4 column expanded to zero");
     }
 
+    /// FIX 1 regression guard: an unpartitioned in-scope table with
+    /// REPLICA IDENTITY FULL sends `OldTableRow::Full` on deletes. The Full
+    /// image must be accepted as a tombstone directly — dedup-by-id makes
+    /// non-key columns irrelevant but harmless. Before the fix this arm called
+    /// `into_key()` on a Full row, got `None`, and returned an error.
+    #[test]
+    fn unpartitioned_full_delete_appends_tombstone() {
+        let schema = unpartitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // Full old row: id=7, label="hello", score=10 — exactly what
+        // REPLICA IDENTITY FULL sends on a DELETE.
+        let full_row = TableRow::new(vec![
+            Cell::I32(7),
+            Cell::String("hello".to_owned()),
+            Cell::I32(10),
+        ]);
+        let muts = vec![tracked(
+            20,
+            TableMutation::Delete(OldTableRow::Full(full_row)),
+        )];
+        let ops = prepare_append_mutations(&schema, muts, false, &specs).unwrap();
+        assert_eq!(ops.len(), 1, "one tombstone append for the FULL delete");
+        let (_, deleted) = append_cdc(&ops[0]);
+        assert!(deleted, "FULL delete on unpartitioned table => tombstone (_etl_deleted = true)");
+        // The id column must carry the real value from the full old row.
+        let PreparedTableMutation::Append { rows } = &ops[0] else {
+            unreachable!("already asserted Append above");
+        };
+        let id_col = rows
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        assert_eq!(id_col.value(0), 7, "id value preserved from the full old row");
+    }
+
     /// Task 19: a key-only DEFAULT-identity backlog delete on a partitioned
     /// in-scope table no longer errors. It falls back to the destructive
     /// scan-based `Delete` (origin "backlog"), not an Append-tombstone.
@@ -4530,12 +4599,15 @@ mod merge_on_read_apply_tests {
         assert_eq!(desc_jul.as_deref(), Some("v2"));
     }
 
-    /// Task 7 — regression guard: every mutation type must produce only `Append`
-    /// ops (never `Merge`, `Delete`, `Update`, `DedupedUpsert`, or `Upsert`).
+    /// Task 7 — regression guard: post-cutover (full old row) mutations on an
+    /// in-scope table must produce only `Append` ops (never `Merge`, `Delete`,
+    /// `Update`, `DedupedUpsert`, or `Upsert`).
     ///
     /// `Append` is the only scan-free INSERT path; any other variant would
-    /// reintroduce a target-table scan for in-scope tables. This test fails if
-    /// a future change routes any mutation through the non-append path.
+    /// reintroduce a target-table scan for in-scope tables. Note: key-only
+    /// backlog inputs legitimately produce `Delete` (destructive fallback) or
+    /// `AppendReconstruct` — this test uses full old rows only, matching the
+    /// post-cutover `REPLICA IDENTITY FULL` steady state.
     #[test]
     fn merge_on_read_emits_only_append_ops() {
         let schema = partitioned_schema();
