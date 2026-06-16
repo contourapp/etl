@@ -191,28 +191,6 @@ pub(super) fn compact_table(
     collapse_scope(conn, table, Some(&format!("{EFFECTIVE_AT_LOCAL_COLUMN} IS NULL")))
 }
 
-/// One-time cutover pass removing backlog-move strandings — pre-`REPLICA IDENTITY
-/// FULL` moves that left two live images of one `id` in different month
-/// partitions. Scoped to ids spanning >1 partition so the pass stays bounded;
-/// unpartitioned tables can't strand and take a single pass.
-pub(super) fn global_dedup_table(
-    conn: &duckdb::Connection,
-    table: &str,
-    partitioned: bool,
-) -> EtlResult<()> {
-    if !partitioned {
-        return collapse_scope(conn, table, None);
-    }
-    let qualified = qualified_lake_table_name(table);
-    // NULL-eff rows can't strand across partitions, so exclude them.
-    let stranded = format!(
-        "id IN (SELECT id FROM {qualified} WHERE {EFFECTIVE_AT_LOCAL_COLUMN} IS NOT NULL \
-         GROUP BY id HAVING count(DISTINCT (year({EFFECTIVE_AT_LOCAL_COLUMN}) * 100 \
-         + month({EFFECTIVE_AT_LOCAL_COLUMN}))) > 1)"
-    );
-    collapse_scope(conn, table, Some(&stranded))
-}
-
 /// Runs incremental merge-on-read compaction across the given tables. Each entry
 /// is `(table_name, is_partitioned)`. Stops on the first error.
 pub fn run_merge_on_read_compaction(
@@ -226,25 +204,11 @@ pub fn run_merge_on_read_compaction(
     Ok(())
 }
 
-/// Runs the one-time cutover global dedup across the given tables (removing
-/// backlog-move strandings). Each entry is `(table_name, is_partitioned)`. Stops
-/// on the first error.
-pub fn run_merge_on_read_global_dedup(
-    conn: &duckdb::Connection,
-    tables: &[(String, bool)],
-) -> EtlResult<()> {
-    for (table, partitioned) in tables {
-        tracing::info!(table = %table, "DuckLake: running global dedup on table");
-        global_dedup_table(conn, table, *partitioned)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod compaction_tests {
     use duckdb::Connection;
 
-    use super::{compact_table, global_dedup_table, run_merge_on_read_compaction};
+    use super::{compact_table, run_merge_on_read_compaction};
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -321,53 +285,6 @@ mod compaction_tests {
             .query_row("SELECT COUNT(*) FROM t WHERE id = 3", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "exactly one row survives for id=3");
-    }
-
-    #[test]
-    fn global_dedup_removes_cross_partition_stranded_image() {
-        // Backlog-move shape: id=7 was moved from effective_month=3 to
-        // effective_month=7. Because REPLICA IDENTITY FULL was not yet enabled,
-        // the old-partition image has NO tombstone. Both live rows exist in the
-        // table; the higher-version (v2, month=7) image must survive and the
-        // stranded lower-version (v1, month=3) image must be dropped.
-        let conn = open();
-        conn.execute_batch(
-            "CREATE TABLE t (id INTEGER, effective_month INTEGER, credit INTEGER, \
-             _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
-        )
-        .unwrap();
-
-        conn.execute_batch(
-            "INSERT INTO t VALUES
-               (7, 3, 10, 1, false),
-               (7, 7, 10, 2, false);",
-        )
-        .unwrap();
-
-        global_dedup_table(&conn, "t", false).unwrap();
-
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 1, "exactly one row survives for id=7 after dedup");
-
-        let month: i32 = conn
-            .query_row("SELECT effective_month FROM t WHERE id = 7", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(month, 7, "the higher-version (month=7) image must survive; stranded month=3 dropped");
-
-        // Idempotency: calling again must leave the result unchanged.
-        global_dedup_table(&conn, "t", false).unwrap();
-
-        let total_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total_after, 1, "idempotent: still one row after second call");
-
-        let month_after: i32 = conn
-            .query_row("SELECT effective_month FROM t WHERE id = 7", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(month_after, 7, "idempotent: month=7 still survives after second call");
     }
 
     #[test]
@@ -572,9 +489,9 @@ mod compaction_tests {
         assert_eq!(total, 2, "one live row each for id=1 (May) and id=3 (July)");
     }
 
-    /// Per-month independence: id=1 is live in both May and July (a stranding);
-    /// `compact_table` collapses each month separately so both survive (a
-    /// full-table collapse would leave one). Strandings are `global_dedup_table`'s job.
+    /// Per-month independence: id=1 is live in both May and July; `compact_table`
+    /// collapses each month separately so both survive (a full-table collapse
+    /// would leave one).
     #[test]
     fn compact_table_collapses_months_independently() {
         let conn = open();
@@ -604,36 +521,5 @@ mod compaction_tests {
             .query_row("SELECT credit FROM t WHERE month(effective_at_local) = 7", [], |r| r.get(0))
             .unwrap();
         assert_eq!(jul, 99, "July: v4 wins");
-    }
-
-    /// Cutover global dedup removes a cross-partition stranding (id=7 in both May
-    /// and July, July wins) while leaving a single-partition id untouched.
-    #[test]
-    fn global_dedup_partitioned_removes_cross_partition_stranding() {
-        let conn = open();
-        conn.execute_batch(
-            "CREATE TABLE t (id INTEGER, credit INTEGER, effective_at_local TIMESTAMP, \
-             _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
-        )
-        .unwrap();
-        conn.execute_batch(
-            "INSERT INTO t VALUES
-               (7, 1, TIMESTAMP '2026-05-03', 1, false),
-               (7, 2, TIMESTAMP '2026-07-02', 2, false),
-               (8, 3, TIMESTAMP '2026-05-04', 1, false);",
-        )
-        .unwrap();
-
-        global_dedup_table(&conn, "t", true).unwrap();
-
-        let total7: i64 =
-            conn.query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0)).unwrap();
-        assert_eq!(total7, 1, "stranded id=7 deduped to one row");
-        let credit7: i32 =
-            conn.query_row("SELECT credit FROM t WHERE id = 7", [], |r| r.get(0)).unwrap();
-        assert_eq!(credit7, 2, "higher-version (July) image wins");
-        let total8: i64 =
-            conn.query_row("SELECT COUNT(*) FROM t WHERE id = 8", [], |r| r.get(0)).unwrap();
-        assert_eq!(total8, 1, "single-partition id=8 untouched");
     }
 }
