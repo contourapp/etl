@@ -72,12 +72,15 @@ use crate::{
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
-/// Each batch pays at least one target-table scan for its MERGE and delete
-/// statements (random-UUID keys defeat all file pruning), so the cap is set
-/// high enough that a whole pipeline event delivery applies as one scan.
-/// Transaction-lifetime conflicts are no longer a concern: maintenance holds
-/// the write pause and watermark writes are append-only.
-const CDC_MUTATION_BATCH_SIZE: usize = 65_536;
+/// Mutations apply append-only (no MERGE/delete scan), so this cap now governs
+/// how many wide rows a single partitioned-write `INSERT` buffers. During
+/// backlog drain a batch fans out across many `effective_at_local` partitions
+/// and the writer holds a Parquet row group open per partition, so a smaller cap
+/// keeps peak buffering under the connection's `memory_limit` (the 65,536 cap
+/// OOMed `public_lines` at 4GB). Transaction-lifetime conflicts are not a
+/// concern: maintenance holds the write pause and watermark writes are
+/// append-only.
+const CDC_MUTATION_BATCH_SIZE: usize = 16_384;
 /// Value recorded under the prepared-rows-kind metric label; every staging
 /// payload is now an Arrow record batch.
 const PREPARED_ROWS_KIND: &str = "arrow";

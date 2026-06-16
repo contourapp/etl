@@ -37,9 +37,22 @@ const PARQUET_VERSION_OPTION_NAME: &str = "parquet_version";
 const PARQUET_VERSION_OPTION_VALUE: u8 = 2;
 const PRESERVE_INSERTION_ORDER_OPTION_NAME: &str = "preserve_insertion_order";
 
-/// Builds the SQL that configures DuckDB's session-level write ordering.
+/// Caps worker threads on apply/compaction connections. The partitioned DuckLake
+/// writer buffers a Parquet row group per open partition *per thread*; during
+/// backlog drain a single wide append can fan out across many (year, month)
+/// `effective_at_local` partitions, so uncapped threads multiply write-buffer
+/// memory past the connection's `memory_limit` (observed OOM on `public_lines`
+/// at the 4GB cap). Apply is S3-I/O-bound, so a low cap costs little throughput.
+const WRITER_THREAD_LIMIT: u8 = 4;
+
+/// Builds the SQL that configures DuckDB's session-level write tuning: disable
+/// insertion-order preservation (the merge-on-read append log carries no
+/// meaningful physical order) and cap worker threads to bound the
+/// partitioned-writer memory fan-out during large appends.
 fn configure_writer_session_sql() -> String {
-    format!("SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false;")
+    format!(
+        "SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false; SET threads = {WRITER_THREAD_LIMIT};"
+    )
 }
 
 /// Builds the SQL that configures DuckLake's global Parquet writer settings.
