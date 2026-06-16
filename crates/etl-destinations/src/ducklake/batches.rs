@@ -42,7 +42,7 @@ use crate::{
         DuckLakeTableName, LAKE_CATALOG,
         arrow_staging::{
             CastKind, PreparedRows, StagingColumnSpec, build_staging_specs,
-            build_staging_specs_with_cdc, prepare_rows, prepare_rows_with_cdc,
+            build_staging_specs_with_cdc, prepare_rows, prepare_rows_with_per_row_cdc,
         },
         client::{
             DuckLakeBlockingOperationContext, DuckLakeConnectionManager, format_query_error_detail,
@@ -206,7 +206,7 @@ enum PreparedTableMutation {
         rows: PreparedRows,
     },
     /// Merge-on-read read-before-write append for the DEFAULT-replica-identity
-    /// backlog (Task 19).
+    /// backlog.
     ///
     /// A backlog `Update` carrying a `Partial` (unchanged-TOAST) new row plus a
     /// key-only old row cannot be reconstructed at prepare time — there is no
@@ -1426,20 +1426,52 @@ fn prepare_append_mutations(
 
     let mut prepared_mutations = Vec::new();
 
-    // Emits one append (plain INSERT, no dedup) for one CDC image.
-    macro_rules! push_append {
-        ($rows:expr, $version:expr, $deleted:expr) => {
-            prepared_mutations.push(PreparedTableMutation::Append {
-                rows: prepare_rows_with_cdc($rows, staging_specs, $version, $deleted)?,
-            });
-        };
+    // Consecutive plain appends accumulate here and flush as ONE multi-row
+    // `Append` (a single staged INSERT). Each CDC image carries its own packed
+    // version and tombstone flag, so rows and their per-row CDC values are
+    // buffered in lockstep. Without this every CDC event became its own
+    // single-row INSERT, and each INSERT pays DuckLake's fixed per-statement
+    // table-open cost — catastrophic in both memory and throughput on a large
+    // table.
+    let mut append_rows: Vec<TableRow> = Vec::new();
+    let mut append_versions: Vec<u128> = Vec::new();
+    let mut append_deleted: Vec<bool> = Vec::new();
+
+    // Buffers one CDC image into the pending append run.
+    macro_rules! buffer_append {
+        ($rows:expr, $version:expr, $deleted:expr) => {{
+            for row in $rows {
+                append_rows.push(row);
+                append_versions.push($version);
+                append_deleted.push($deleted);
+            }
+        }};
+    }
+    // Flushes the pending append run as one multi-row `Append`. Must be called
+    // before pushing any mutation that scans the target (a backlog destructive
+    // delete or an `AppendReconstruct` read-before-write) so LSN order — and the
+    // read-your-writes those mutations rely on — is preserved.
+    macro_rules! flush_appends {
+        () => {{
+            if !append_rows.is_empty() {
+                let rows = prepare_rows_with_per_row_cdc(
+                    std::mem::take(&mut append_rows),
+                    staging_specs,
+                    &append_versions,
+                    &append_deleted,
+                )?;
+                append_versions.clear();
+                append_deleted.clear();
+                prepared_mutations.push(PreparedTableMutation::Append { rows });
+            }
+        }};
     }
 
     for tracked in tracked_mutations {
         let version = version_u128(tracked.commit_lsn, tracked.tx_ordinal);
         match tracked.mutation {
             TableMutation::Insert(row) | TableMutation::Replace(row) => {
-                push_append!(vec![row], version, false);
+                buffer_append!(vec![row], version, false);
             }
             TableMutation::Delete(delete_row) => {
                 if partitioned {
@@ -1450,9 +1482,10 @@ fn prepare_append_mutations(
                     // is gone and merge-on-read then has nothing to merge).
                     if delete_row.as_full().is_some() {
                         let old_full = delete_row.into_full().expect("as_full just matched");
-                        push_append!(vec![build_tombstone_image(old_full)], version, true);
+                        buffer_append!(vec![build_tombstone_image(old_full)], version, true);
                     } else {
                         record_backlog_fallback("delete");
+                        flush_appends!();
                         prepared_mutations.push(backlog_destructive_delete(
                             replicated_table_schema,
                             &delete_row,
@@ -1470,12 +1503,12 @@ fn prepare_append_mutations(
                             expand_key_row(key_row, replicated_table_schema)
                         }
                     };
-                    push_append!(vec![tombstone], version, true);
+                    buffer_append!(vec![tombstone], version, true);
                 }
             }
             TableMutation::Update { delete_row, new_row } => {
                 // Post-cutover (REPLICA IDENTITY FULL) every update carries a
-                // full old row, so the normal Task 6 paths run. The
+                // full old row, so the normal full-old-row paths run. The
                 // DEFAULT-identity backlog instead carries a key-only old row;
                 // those branches drain through the per-record fallback.
                 match delete_row.as_full() {
@@ -1502,15 +1535,15 @@ fn prepare_append_mutations(
                             // the tombstone image.
                             let moved = is_partition_move(&old_full, &new_full, eff_idx);
                             if moved {
-                                push_append!(
+                                buffer_append!(
                                     vec![build_tombstone_image(old_full)],
                                     version,
                                     true
                                 );
                             }
-                            push_append!(vec![new_full], version, false);
+                            buffer_append!(vec![new_full], version, false);
                         } else {
-                            push_append!(vec![new_full], version, false);
+                            buffer_append!(vec![new_full], version, false);
                         }
                     }
                     None => match new_row {
@@ -1521,13 +1554,14 @@ fn prepare_append_mutations(
                         // global-dedup pass.
                         UpdatedTableRow::Full(new_full) => {
                             record_backlog_fallback("full_update");
-                            push_append!(vec![new_full], version, false);
+                            buffer_append!(vec![new_full], version, false);
                         }
                         // Key-only Partial update (unchanged-TOAST): the full
                         // image cannot be reconstructed at prepare time. Defer to
                         // an apply-time read-before-write against the lake.
                         UpdatedTableRow::Partial(partial) => {
                             record_backlog_fallback("partial_reconstruct");
+                            flush_appends!();
                             prepared_mutations.push(prepare_append_reconstruct(
                                 replicated_table_schema,
                                 &delete_row,
@@ -1542,6 +1576,7 @@ fn prepare_append_mutations(
         }
     }
 
+    flush_appends!();
     Ok(prepared_mutations)
 }
 
@@ -1762,7 +1797,7 @@ fn overlay_partial_on_full(
 /// Builds the error returned when an append-only mutation needs the full old
 /// row image but only a key-only image is available.
 ///
-/// After Task 19, key-only old rows are drained by the per-record backlog
+/// Key-only old rows are drained by the per-record backlog
 /// fallback (see [`prepare_append_mutations`]), so this is only reached on the
 /// genuinely-unreachable defensive paths guarded by a prior `as_full()` match —
 /// it exists to fail loudly should that invariant ever be broken rather than
@@ -2713,7 +2748,7 @@ fn apply_upsert_mutation(
 }
 
 /// Applies one merge-on-read read-before-write reconstruct inside an open
-/// DuckLake transaction (Task 19, key-only backlog `Partial` update).
+/// DuckLake transaction (key-only backlog `Partial` update).
 ///
 /// Reads the prior live image of the row's identity from the target with the
 /// production dedup, overlays the partial's changed columns (already encoded as
@@ -4115,6 +4150,11 @@ mod merge_on_read_apply_tests {
 
     /// Extracts `(version, deleted)` from one produced append batch.
     fn append_cdc(mutation: &PreparedTableMutation) -> (u128, bool) {
+        append_cdc_at(mutation, 0)
+    }
+
+    /// Reads the packed `_etl_version` / `_etl_deleted` of one row of an `Append`.
+    fn append_cdc_at(mutation: &PreparedTableMutation, row: usize) -> (u128, bool) {
         let PreparedTableMutation::Append { rows } = mutation else {
             panic!("expected Append, got a different prepared mutation");
         };
@@ -4130,7 +4170,15 @@ mod merge_on_read_apply_tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("deleted column is Boolean");
-        (version_col.value(0) as u128, deleted_col.value(0))
+        (version_col.value(row) as u128, deleted_col.value(row))
+    }
+
+    /// Number of staged rows in an `Append`.
+    fn append_row_count(mutation: &PreparedTableMutation) -> usize {
+        let PreparedTableMutation::Append { rows } = mutation else {
+            panic!("expected Append, got a different prepared mutation");
+        };
+        rows.batch.num_rows()
     }
 
     #[test]
@@ -4151,11 +4199,12 @@ mod merge_on_read_apply_tests {
             ),
         ];
         let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
-        assert_eq!(appends.len(), 2, "insert + same-partition update => 2 live appends");
-        let (v0, d0) = append_cdc(&appends[0]);
-        let (v1, d1) = append_cdc(&appends[1]);
+        assert_eq!(appends.len(), 1, "insert + same-partition update coalesce into one batched append");
+        assert_eq!(append_row_count(&appends[0]), 2, "two live rows in the one append");
+        let (v0, d0) = append_cdc_at(&appends[0], 0);
+        let (v1, d1) = append_cdc_at(&appends[0], 1);
         assert!(!d0 && !d1, "both live");
-        assert!(v1 > v0, "second append has the higher version");
+        assert!(v1 > v0, "second row has the higher version");
         assert_eq!(v0, version_u128(PgLsn::from(100u64), 0));
         assert_eq!(v1, version_u128(PgLsn::from(100u64), 1));
     }
@@ -4192,11 +4241,12 @@ mod merge_on_read_apply_tests {
             },
         )];
         let appends = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
-        assert_eq!(appends.len(), 2, "move => tombstone + live");
-        let (vt, dt) = append_cdc(&appends[0]);
-        let (vl, dl) = append_cdc(&appends[1]);
-        assert!(dt, "first append is the old-partition tombstone");
-        assert!(!dl, "second append is the new-partition live image");
+        assert_eq!(appends.len(), 1, "move coalesces tombstone + live into one batched append");
+        assert_eq!(append_row_count(&appends[0]), 2, "tombstone row then live row");
+        let (vt, dt) = append_cdc_at(&appends[0], 0);
+        let (vl, dl) = append_cdc_at(&appends[0], 1);
+        assert!(dt, "first row is the old-partition tombstone");
+        assert!(!dl, "second row is the new-partition live image");
         assert_eq!(vt, vl, "tombstone and live share the same version V");
     }
 
@@ -4335,7 +4385,7 @@ mod merge_on_read_apply_tests {
         assert_eq!(id_col.value(0), 7, "id value preserved from the full old row");
     }
 
-    /// Task 19: a key-only DEFAULT-identity backlog delete on a partitioned
+    /// A key-only DEFAULT-identity backlog delete on a partitioned
     /// in-scope table no longer errors. It falls back to the destructive
     /// scan-based `Delete` (origin "backlog"), not an Append-tombstone.
     #[test]
@@ -4362,7 +4412,56 @@ mod merge_on_read_apply_tests {
         }
     }
 
-    /// Task 19: a key-only DEFAULT-identity backlog `Update(Full)` appends the
+    /// Interleaving guard: plain appends split around a scan-bearing mutation (a
+    /// key-only backlog delete) must flush the pending append run BEFORE the
+    /// delete and resume buffering after it, yielding `[Append, Delete, Append]`
+    /// in LSN order. A missed flush would let the destructive delete's target
+    /// scan run before the prior-LSN appends are written — silent corruption.
+    #[test]
+    fn appends_split_around_scan_bearing_mutation_preserve_order() {
+        let schema = partitioned_schema();
+        let specs = build_staging_specs_with_cdc(
+            &schema.column_schemas().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let muts = vec![
+            tracked(0, TableMutation::Insert(full_row("2026-05-10T00:00:00Z", "v1"))),
+            tracked(
+                1,
+                TableMutation::Delete(OldTableRow::Key(TableRow::new(vec![Cell::String(
+                    ID_A.to_owned(),
+                )]))),
+            ),
+            tracked(2, TableMutation::Insert(full_row("2026-06-10T00:00:00Z", "v2"))),
+        ];
+        let ops = prepare_append_mutations(&schema, muts, true, &specs).unwrap();
+        assert_eq!(
+            ops.len(),
+            3,
+            "appends flush around the scan-bearing delete: [Append, Delete, Append]"
+        );
+
+        // First append run: the pre-delete insert only.
+        assert_eq!(append_row_count(&ops[0]), 1, "pre-delete append run has one row");
+        let (v0, d0) = append_cdc_at(&ops[0], 0);
+        assert!(!d0, "first append is live");
+
+        // The destructive delete sits between the two append runs.
+        match &ops[1] {
+            PreparedTableMutation::Delete { origin, .. } => {
+                assert_eq!(*origin, "backlog");
+            }
+            _ => panic!("expected the key-only backlog delete between the append runs"),
+        }
+
+        // Second append run: the post-delete insert only, at a higher version.
+        assert_eq!(append_row_count(&ops[2]), 1, "post-delete append run has one row");
+        let (v2, d2) = append_cdc_at(&ops[2], 0);
+        assert!(!d2, "second append is live");
+        assert!(v2 > v0, "post-delete append carries the higher (later-LSN) version");
+    }
+
+    /// A key-only DEFAULT-identity backlog `Update(Full)` appends the
     /// live new image and emits NO tombstone, even on a partitioned table (we
     /// cannot detect a move without the old effective_at_local).
     #[test]
@@ -4385,7 +4484,7 @@ mod merge_on_read_apply_tests {
         assert!(!deleted, "the single append is the live new image");
     }
 
-    /// Task 19 end-to-end: a key-only DEFAULT-identity backlog `Update(Partial)`
+    /// End-to-end: a key-only DEFAULT-identity backlog `Update(Partial)`
     /// (unchanged-TOAST) reconstructs its full image at apply time by reading the
     /// prior live image from the lake. The appended row must carry the partial's
     /// NEW value for the changed column AND the prior lake image's value for the
@@ -4613,7 +4712,7 @@ mod merge_on_read_apply_tests {
         assert_eq!(desc_jul.as_deref(), Some("v2"));
     }
 
-    /// Task 7 — regression guard: post-cutover (full old row) mutations on an
+    /// Regression guard: post-cutover (full old row) mutations on an
     /// in-scope table must produce only `Append` ops (never `Merge`, `Delete`,
     /// `Update`, `DedupedUpsert`, or `Upsert`).
     ///
@@ -4667,12 +4766,14 @@ mod merge_on_read_apply_tests {
             );
         }
 
-        // Sanity-check the expected count:
-        // Insert (1) + same-partition update (1) + partition-move (2: tombstone + live) + delete (1) = 5
-        assert_eq!(ops.len(), 5, "expected 5 append ops for the representative mix");
+        // The whole run of plain appends coalesces into ONE batched Append (one
+        // staged INSERT). Its rows: Insert (1) + same-partition update (1) +
+        // partition-move (2: tombstone + live) + delete (1) = 5.
+        assert_eq!(ops.len(), 1, "the representative mix coalesces into one append op");
+        assert_eq!(append_row_count(&ops[0]), 5, "expected 5 append rows for the representative mix");
     }
 
-    /// Task 8 — unchanged-TOAST behavioral guard: a partial update (simulating
+    /// Unchanged-TOAST behavioral guard: a partial update (simulating
     /// an unchanged-TOAST column) must produce an appended image that carries the
     /// real old-row value for the missing column, not a placeholder or NULL.
     ///

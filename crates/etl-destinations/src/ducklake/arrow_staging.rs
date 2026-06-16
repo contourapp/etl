@@ -465,47 +465,59 @@ pub(super) fn build_staging_specs_with_cdc(
     Ok(specs)
 }
 
-/// Builds a [`PreparedRows`] payload carrying the two trailing CDC columns.
+/// Builds a [`PreparedRows`] payload carrying the two trailing CDC columns with
+/// per-row values, so a run of consecutive merge-on-read appends (each a distinct
+/// CDC image with its own packed `_etl_version` and `_etl_deleted` flag) can be
+/// coalesced into one multi-row `PreparedRows` — and therefore one staged INSERT
+/// — instead of one INSERT per row.
 ///
 /// `specs` must be CDC-augmented (i.e. produced by
 /// [`build_staging_specs_with_cdc`]) so its trailing two columns are
-/// `_etl_version` / `_etl_deleted`. Every row in the resulting batch carries the
-/// same constant `version` and `deleted` flag. This mirrors [`prepare_rows`]
-/// but for the merge-on-read append path.
-pub(super) fn prepare_rows_with_cdc(
+/// `_etl_version` / `_etl_deleted`. `versions[i]` / `deleted[i]` apply to
+/// `table_rows[i]`.
+pub(super) fn prepare_rows_with_per_row_cdc(
     table_rows: Vec<TableRow>,
     specs: &[StagingColumnSpec],
-    version: u128,
-    deleted: bool,
+    versions: &[u128],
+    deleted: &[bool],
 ) -> EtlResult<PreparedRows> {
-    let batch = build_record_batch_with_cdc(&table_rows, specs, version, deleted)?;
+    let batch = build_record_batch_with_per_row_cdc(&table_rows, specs, versions, deleted)?;
     Ok(PreparedRows { batch })
 }
 
-/// Builds a RecordBatch with CDC-augmented specs: user columns are built
-/// exactly as [`build_record_batch`] does (reusing [`build_column`] per spec),
-/// then two constant trailing columns are appended — a Decimal128(38,0) holding
-/// `version as i128` for every row, and a Boolean holding `deleted` for every
-/// row.
-///
-/// `version` is a packed `u128` (high 64 bits = commit_lsn, low 64 bits =
-/// tx_ordinal). Realistic values stay far below i128::MAX (the true upper bound
-/// is the DECIMAL(38,0) storage maximum, ~10^38−1), so the i128 conversion is
-/// safe in practice. An explicit guard returns an `EtlResult` error on overflow
-/// rather than panicking, in case of future version-encoding changes.
+/// Builds a CDC-augmented RecordBatch applying one constant `version` /
+/// `deleted` to every row. Thin wrapper over [`build_record_batch_with_per_row_cdc`];
+/// retained for the round-trip unit tests.
+#[cfg(test)]
 pub(super) fn build_record_batch_with_cdc(
     rows: &[TableRow],
     specs: &[StagingColumnSpec],
     version: u128,
     deleted: bool,
 ) -> EtlResult<RecordBatch> {
-    let version_i128 = i128::try_from(version).map_err(|_| {
-        etl_error!(
-            ErrorKind::ConversionError,
-            "CDC version overflows i128 (exceeds DECIMAL(38,0) storage range)",
-            format!("version {version} does not fit in i128; DECIMAL(38,0) max is ~10^38−1")
-        )
-    })?;
+    let versions = vec![version; rows.len()];
+    let deleted = vec![deleted; rows.len()];
+    build_record_batch_with_per_row_cdc(rows, specs, &versions, &deleted)
+}
+
+/// Builds a RecordBatch with CDC-augmented specs: user columns are built
+/// exactly as [`build_record_batch`] does (reusing [`build_column`] per spec),
+/// then two trailing columns are appended — a Decimal128(38,0) holding
+/// `versions[i] as i128`, and a Boolean holding `deleted[i]` — for each row.
+///
+/// Each `version` is a packed `u128` (high 64 bits = commit_lsn, low 64 bits =
+/// tx_ordinal). Realistic values stay far below i128::MAX (the true upper bound
+/// is the DECIMAL(38,0) storage maximum, ~10^38−1), so the i128 conversion is
+/// safe in practice. An explicit guard returns an `EtlResult` error on overflow
+/// rather than panicking, in case of future version-encoding changes.
+pub(super) fn build_record_batch_with_per_row_cdc(
+    rows: &[TableRow],
+    specs: &[StagingColumnSpec],
+    versions: &[u128],
+    deleted: &[bool],
+) -> EtlResult<RecordBatch> {
+    debug_assert_eq!(rows.len(), versions.len(), "versions must be one per row");
+    debug_assert_eq!(rows.len(), deleted.len(), "deleted flags must be one per row");
     let row_count = rows.len();
     let user_count = specs.len().saturating_sub(2);
     let mut fields = Vec::with_capacity(specs.len());
@@ -517,15 +529,22 @@ pub(super) fn build_record_batch_with_cdc(
     let version_spec = &specs[user_count];
     fields.push(Field::new(version_spec.name.as_str(), version_spec.arrow_type.clone(), true));
     let mut version_builder = decimal_builder(38, 0)?;
-    for _ in 0..row_count {
+    for &version in versions {
+        let version_i128 = i128::try_from(version).map_err(|_| {
+            etl_error!(
+                ErrorKind::ConversionError,
+                "CDC version overflows i128 (exceeds DECIMAL(38,0) storage range)",
+                format!("version {version} does not fit in i128; DECIMAL(38,0) max is ~10^38−1")
+            )
+        })?;
         version_builder.append_value(version_i128);
     }
     arrays.push(Arc::new(version_builder.finish()) as ArrayRef);
     let deleted_spec = &specs[user_count + 1];
     fields.push(Field::new(deleted_spec.name.as_str(), deleted_spec.arrow_type.clone(), true));
     let mut deleted_builder = duckdb::arrow::array::BooleanBuilder::with_capacity(row_count);
-    for _ in 0..row_count {
-        deleted_builder.append_value(deleted);
+    for &is_deleted in deleted {
+        deleted_builder.append_value(is_deleted);
     }
     arrays.push(Arc::new(deleted_builder.finish()) as ArrayRef);
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|error| {
