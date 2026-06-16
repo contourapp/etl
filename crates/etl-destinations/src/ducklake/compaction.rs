@@ -4,6 +4,7 @@ use etl::{
 };
 
 use super::merge_on_read::DEDUP_ORDER_BY;
+use super::sql::qualified_lake_table_name;
 
 /// Shared transactional core: snapshot winners into a temp table, DELETE every
 /// row from `table`, then INSERT back only the surviving live rows.
@@ -13,15 +14,19 @@ use super::merge_on_read::DEDUP_ORDER_BY;
 /// the `WHERE _etl_deleted IS NOT TRUE` on the INSERT). This is the full-table form —
 /// callers that need incrementality must add their own scoping on top.
 fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
+    // DuckLake tables live in the `lake` catalog; reference them as
+    // "lake"."<table>" exactly as the apply path does. `_keep` is a temp table
+    // and stays unqualified.
+    let qualified = qualified_lake_table_name(table);
     let sql_begin = "BEGIN TRANSACTION";
     let sql_keep = format!(
         "CREATE OR REPLACE TEMP TABLE _keep AS \
-         SELECT * FROM {table} \
+         SELECT * FROM {qualified} \
          QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY {DEDUP_ORDER_BY}) = 1;"
     );
-    let sql_delete = format!("DELETE FROM {table};");
+    let sql_delete = format!("DELETE FROM {qualified};");
     let sql_insert = format!(
-        "INSERT INTO {table} SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE;"
+        "INSERT INTO {qualified} SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE;"
     );
     let sql_commit = "COMMIT";
 
@@ -197,7 +202,13 @@ mod compaction_tests {
     use super::{compact_partition, global_dedup_by_id, run_merge_on_read_compaction};
 
     fn open() -> Connection {
-        Connection::open_in_memory().unwrap()
+        let conn = Connection::open_in_memory().unwrap();
+        // Production merge-on-read tables live in the DuckLake `lake` catalog, and
+        // collapse_by_id references them as "lake"."<table>". Attach an in-memory
+        // catalog named `lake` and make it the default so the bare-name table SQL
+        // in these tests resolves to the same tables collapse_by_id targets.
+        conn.execute_batch("ATTACH ':memory:' AS lake; USE lake;").unwrap();
+        conn
     }
 
     fn setup(conn: &Connection) {
