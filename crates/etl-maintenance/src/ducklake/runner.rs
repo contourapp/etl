@@ -54,6 +54,12 @@ const PARQUET_ROW_GROUP_SIZE_BYTES_OPTION_VALUE: &str = "20MB";
 const PARQUET_VERSION_OPTION_NAME: &str = "parquet_version";
 const PARQUET_VERSION_OPTION_VALUE: u8 = 2;
 const PRESERVE_INSERTION_ORDER_OPTION_NAME: &str = "preserve_insertion_order";
+
+/// Caps per-connection disk spill so a runaway maintenance op fails recoverably
+/// instead of filling the pod's ephemeral disk and killing the instance (mirrors
+/// the apply/compaction cap). Maintenance ops are bounded per run, so this is a
+/// safety net; recurring temp-dir-full failures here should be alerted on.
+const MAX_TEMP_DIRECTORY_SIZE: &str = "6GB";
 const MAINTENANCE_QUERY_TIMEOUT: Duration = Duration::from_secs(6 * 60);
 const BLOCKING_ABORT_GRACE: Duration = Duration::from_secs(30);
 const DUCKDB_MAINTENANCE_OPERATION_KIND: &str = "maintenance";
@@ -118,7 +124,10 @@ impl DuckDbExtensionStrategy {
 }
 
 fn configure_writer_session_sql() -> String {
-    format!("SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false;")
+    format!(
+        "SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false; \
+         SET max_temp_directory_size = '{MAX_TEMP_DIRECTORY_SIZE}';"
+    )
 }
 
 fn configure_parquet_settings_sql() -> String {

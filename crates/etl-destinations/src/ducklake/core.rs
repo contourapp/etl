@@ -1372,7 +1372,7 @@ where
     /// [`crate::ducklake::compaction::run_merge_on_read_compaction`]. If the
     /// merge-on-read scope is empty the call is a no-op.
     pub async fn compact_merge_on_read(&self) -> EtlResult<()> {
-        let tables = self.merge_on_read_scope.tables();
+        let tables = self.merge_on_read_tables_with_partitioning();
         if tables.is_empty() {
             return Ok(());
         }
@@ -1380,6 +1380,19 @@ where
             crate::ducklake::compaction::run_merge_on_read_compaction(conn, &tables)
         })
         .await
+    }
+
+    /// The in-scope merge-on-read tables paired with whether each is partitioned,
+    /// as the compaction entrypoints expect.
+    fn merge_on_read_tables_with_partitioning(&self) -> Vec<(String, bool)> {
+        self.merge_on_read_scope
+            .tables()
+            .into_iter()
+            .map(|table| {
+                let partitioned = self.merge_on_read_scope.is_partitioned(&table);
+                (table, partitioned)
+            })
+            .collect()
     }
 
     /// Runs a one-time global dedup pass across every in-scope merge-on-read
@@ -1390,7 +1403,7 @@ where
     /// [`crate::ducklake::compaction::run_merge_on_read_global_dedup`]. If the
     /// merge-on-read scope is empty the call is a no-op.
     pub async fn run_merge_on_read_cutover_dedup(&self) -> EtlResult<()> {
-        let tables = self.merge_on_read_scope.tables();
+        let tables = self.merge_on_read_tables_with_partitioning();
         if tables.is_empty() {
             return Ok(());
         }

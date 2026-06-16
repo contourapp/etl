@@ -3,34 +3,59 @@ use etl::{
     etl_error,
 };
 
-use super::merge_on_read::DEDUP_ORDER_BY;
+use super::merge_on_read::{DEDUP_ORDER_BY, EFFECTIVE_AT_LOCAL_COLUMN};
 use super::sql::qualified_lake_table_name;
 
-/// Shared transactional core: snapshot winners into a temp table, DELETE every
-/// row from `table`, then INSERT back only the surviving live rows.
+/// Collapses one scope — the whole table (`where_pred = None`) or a single
+/// partition / id-set — to one live row per `id` via a snapshot-temp / `DELETE` /
+/// re-`INSERT` rewrite in one transaction (`DEDUP_ORDER_BY` picks the winner;
+/// tombstone winners are dropped).
 ///
-/// The QUALIFY window keeps the highest-version row per `id`; a tombstone
-/// surviving as the winner causes its entire group to be dropped (because of
-/// the `WHERE _etl_deleted IS NOT TRUE` on the INSERT). This is the full-table form —
-/// callers that need incrementality must add their own scoping on top.
-fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
-    // DuckLake tables live in the `lake` catalog; reference them as
-    // "lake"."<table>" exactly as the apply path does. `_keep` is a temp table
-    // and stays unqualified.
+/// Two guards: empty or already-collapsed scopes skip before any transaction
+/// (this is what makes the per-partition driver incremental); a collapse to zero
+/// live rows skips the `DELETE`, since DuckLake 1.5.3 FATALs (uncatchable process
+/// abort) on a collapse-to-empty — the tombstones are left in place and reads
+/// ignore them anyway.
+fn collapse_scope(
+    conn: &duckdb::Connection,
+    table: &str,
+    where_pred: Option<&str>,
+) -> EtlResult<()> {
     let qualified = qualified_lake_table_name(table);
-    let sql_begin = "BEGIN TRANSACTION";
-    let sql_keep = format!(
-        "CREATE OR REPLACE TEMP TABLE _keep AS \
-         SELECT * FROM {qualified} \
-         QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY {DEDUP_ORDER_BY}) = 1;"
-    );
-    let sql_delete = format!("DELETE FROM {qualified};");
-    let sql_insert = format!(
-        "INSERT INTO {qualified} SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE;"
-    );
-    let sql_commit = "COMMIT";
+    let where_sql = match where_pred {
+        Some(pred) => format!(" WHERE {pred}"),
+        None => String::new(),
+    };
 
-    conn.execute_batch(sql_begin).map_err(|err| {
+    let probe = |label: &'static str, sql: String| -> EtlResult<i64> {
+        conn.query_row(&sql, [], |r| r.get(0)).map_err(|err| {
+            etl_error!(ErrorKind::DestinationQueryFailed, label, format!("table={table}"), source: err)
+        })
+    };
+    let (rows, distinct_ids, tombstones): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT count(*), count(DISTINCT id), \
+                 count(*) FILTER (WHERE _etl_deleted IS TRUE) FROM {qualified}{where_sql}"
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|err| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake compaction scope probe failed",
+                format!("table={table}"),
+                source: err
+            )
+        })?;
+    // Nothing to collapse: empty scope, or already one row per id with no
+    // tombstones to drop.
+    if rows == 0 || (rows == distinct_ids && tombstones == 0) {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN TRANSACTION").map_err(|err| {
         etl_error!(
             ErrorKind::DestinationQueryFailed,
             "DuckLake compaction BEGIN TRANSACTION failed",
@@ -40,7 +65,12 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     })?;
 
     let result = (|| -> EtlResult<()> {
-        conn.execute_batch(&sql_keep).map_err(|err| {
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TEMP TABLE _keep AS \
+             SELECT * FROM {qualified}{where_sql} \
+             QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY {DEDUP_ORDER_BY}) = 1;"
+        ))
+        .map_err(|err| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake compaction snapshot failed",
@@ -48,15 +78,29 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
                 source: err
             )
         })?;
-        conn.execute_batch(&sql_delete).map_err(|err| {
-            etl_error!(
-                ErrorKind::DestinationQueryFailed,
-                "DuckLake compaction delete failed",
-                format!("table={table}"),
-                source: err
-            )
-        })?;
-        conn.execute_batch(&sql_insert).map_err(|err| {
+
+        let live = probe(
+            "DuckLake compaction survivor count failed",
+            "SELECT count(*) FROM _keep WHERE _etl_deleted IS NOT TRUE".to_owned(),
+        )?;
+        // Collapse-to-empty: skip the destructive rewrite (see the fn doc).
+        if live == 0 {
+            return Ok(());
+        }
+
+        conn.execute_batch(&format!("DELETE FROM {qualified}{where_sql};"))
+            .map_err(|err| {
+                etl_error!(
+                    ErrorKind::DestinationQueryFailed,
+                    "DuckLake compaction delete failed",
+                    format!("table={table}"),
+                    source: err
+                )
+            })?;
+        conn.execute_batch(&format!(
+            "INSERT INTO {qualified} SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE;"
+        ))
+        .map_err(|err| {
             etl_error!(
                 ErrorKind::DestinationQueryFailed,
                 "DuckLake compaction insert failed",
@@ -69,7 +113,7 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
 
     match result {
         Ok(()) => {
-            conn.execute_batch(sql_commit).map_err(|err| {
+            conn.execute_batch("COMMIT").map_err(|err| {
                 etl_error!(
                     ErrorKind::DestinationQueryFailed,
                     "DuckLake compaction COMMIT failed",
@@ -88,109 +132,110 @@ fn collapse_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
     }
 }
 
-/// Compacts the merge-on-read append log for `table`, collapsing multiple
-/// versioned rows per `id` down to at most one surviving live row.
-///
-/// **Current behavior (full-table):** scans every row in `table` with a single
-/// `PARTITION BY id ORDER BY _etl_version DESC, _etl_deleted ASC` window,
-/// keeping only the highest-version row per `id` across all physical DuckLake
-/// partitions. Rows whose surviving image is a tombstone (`_etl_deleted = true`)
-/// are dropped entirely — the `id` disappears from the table. Because the
-/// deduplication crosses all partitions in one pass, a partition-move tombstone
-/// and its corresponding live image in a different partition are handled
-/// correctly: the higher-version image wins and the lower-version one is removed.
-///
-/// **Implementation:** delegates to [`collapse_by_id`] which runs three
-/// statements inside one transaction:
-/// 1. `CREATE OR REPLACE TEMP TABLE _keep AS SELECT * QUALIFY …` — snapshot
-///    winners without touching the target.
-/// 2. `DELETE FROM <table>` — physically clear every row.
-/// 3. `INSERT INTO <table> SELECT * FROM _keep WHERE _etl_deleted IS NOT TRUE` —
-///    write back only live survivors.
-///
-/// # TODO: scope to recently-written partitions for incrementality
-/// A future incremental pass would identify recently-written DuckLake partitions
-/// via a watermark and restrict the DELETE + INSERT to those partition ranges,
-/// making the cost O(new data) rather than O(table).
-///
-/// # Errors
-/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on any SQL
-/// failure, mirroring the error handling pattern in `batches.rs`.
-pub(super) fn compact_partition(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
-    collapse_by_id(conn, table)
+/// Lists the distinct `(year, month)` partitions of `effective_at_local` present
+/// in a partitioned table.
+fn distinct_month_partitions(
+    conn: &duckdb::Connection,
+    table: &str,
+) -> EtlResult<Vec<(i64, i64)>> {
+    let qualified = qualified_lake_table_name(table);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT DISTINCT year({EFFECTIVE_AT_LOCAL_COLUMN}) AS y, \
+             month({EFFECTIVE_AT_LOCAL_COLUMN}) AS m FROM {qualified} \
+             WHERE {EFFECTIVE_AT_LOCAL_COLUMN} IS NOT NULL ORDER BY y, m"
+        ))
+        .map_err(|err| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake compaction partition listing failed",
+                format!("table={table}"),
+                source: err
+            )
+        })?;
+    let parts = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map_err(|err| {
+            etl_error!(
+                ErrorKind::DestinationQueryFailed,
+                "DuckLake compaction partition listing failed",
+                format!("table={table}"),
+                source: err
+            )
+        })?;
+    Ok(parts)
 }
 
-/// One-time cross-partition dedup pass run at cutover to remove
-/// *backlog-move strandings*.
-///
-/// **Problem:** rows produced before `REPLICA IDENTITY FULL` was enabled may
-/// have a partition-move recorded as a new-partition INSERT with no matching
-/// tombstone for the old partition. After the backlog is loaded both images
-/// exist as live rows with different `_etl_version` values. A per-partition
-/// compaction pass cannot remove the stale image because it never sees a
-/// tombstone for it — the two live rows live in different physical DuckLake
-/// partitions.
-///
-/// **Solution:** a single full-table `PARTITION BY id` collapse (via
-/// [`collapse_by_id`]) naturally dedups across physical partition boundaries
-/// because DuckDB reads all rows into the same execution context. The
-/// highest-version image per `id` survives; the lower-version stranded image
-/// is dropped.
-///
-/// This function is **idempotent**: calling it on an already-clean table is a
-/// no-op (the single surviving row per `id` is already the winner).
-///
-/// # Errors
-/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on any SQL
-/// failure.
-pub(super) fn global_dedup_by_id(conn: &duckdb::Connection, table: &str) -> EtlResult<()> {
-    collapse_by_id(conn, table)
+/// Compacts one merge-on-read table to one live row per `id`. Partitioned tables
+/// collapse one `(year, month)` of `effective_at_local` at a time so memory/spill
+/// stay bounded (forecasts are just more month partitions) and per-partition
+/// guards make it incremental; unpartitioned tables take a single guarded pass.
+pub(super) fn compact_table(
+    conn: &duckdb::Connection,
+    table: &str,
+    partitioned: bool,
+) -> EtlResult<()> {
+    if !partitioned {
+        return collapse_scope(conn, table, None);
+    }
+    for (year, month) in distinct_month_partitions(conn, table)? {
+        let pred = format!(
+            "year({EFFECTIVE_AT_LOCAL_COLUMN}) = {year} AND \
+             month({EFFECTIVE_AT_LOCAL_COLUMN}) = {month}"
+        );
+        collapse_scope(conn, table, Some(&pred))?;
+    }
+    // Rows without an effective_at_local fall outside every month partition;
+    // collapse them separately (guarded, so a no-op when none exist).
+    collapse_scope(conn, table, Some(&format!("{EFFECTIVE_AT_LOCAL_COLUMN} IS NULL")))
 }
 
-/// Runs merge-on-read compaction across all given tables, collapsing
-/// multi-version append logs down to at most one live row per `id`.
-///
-/// Callers control invocation frequency — the maintenance interval in
-/// contour-core determines how often this runs. Per-table version-count gating
-/// (skipping tables with few versions) is a future optimization; for now every
-/// listed table is compacted on each call.
-///
-/// Stops on the first error and returns it; tables listed after the failing one
-/// are not processed.
-///
-/// # Errors
-/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on the first
-/// table that fails.
+/// One-time cutover pass removing backlog-move strandings — pre-`REPLICA IDENTITY
+/// FULL` moves that left two live images of one `id` in different month
+/// partitions. Scoped to ids spanning >1 partition so the pass stays bounded;
+/// unpartitioned tables can't strand and take a single pass.
+pub(super) fn global_dedup_table(
+    conn: &duckdb::Connection,
+    table: &str,
+    partitioned: bool,
+) -> EtlResult<()> {
+    if !partitioned {
+        return collapse_scope(conn, table, None);
+    }
+    let qualified = qualified_lake_table_name(table);
+    // NULL-eff rows can't strand across partitions, so exclude them.
+    let stranded = format!(
+        "id IN (SELECT id FROM {qualified} WHERE {EFFECTIVE_AT_LOCAL_COLUMN} IS NOT NULL \
+         GROUP BY id HAVING count(DISTINCT (year({EFFECTIVE_AT_LOCAL_COLUMN}) * 100 \
+         + month({EFFECTIVE_AT_LOCAL_COLUMN}))) > 1)"
+    );
+    collapse_scope(conn, table, Some(&stranded))
+}
+
+/// Runs incremental merge-on-read compaction across the given tables. Each entry
+/// is `(table_name, is_partitioned)`. Stops on the first error.
 pub fn run_merge_on_read_compaction(
     conn: &duckdb::Connection,
-    tables: &[String],
+    tables: &[(String, bool)],
 ) -> EtlResult<()> {
-    for table in tables {
+    for (table, partitioned) in tables {
         tracing::info!(table = %table, "DuckLake: compacting merge-on-read table");
-        compact_partition(conn, table)?;
+        compact_table(conn, table, *partitioned)?;
     }
     Ok(())
 }
 
-/// Runs a one-time global dedup pass across all given tables, removing
-/// backlog-move strandings that per-partition compaction cannot resolve.
-///
-/// This is the cutover pass — run once after the initial backlog load before
-/// switching to incremental compaction via [`run_merge_on_read_compaction`].
-///
-/// Stops on the first error and returns it; tables listed after the failing one
-/// are not processed.
-///
-/// # Errors
-/// Returns an `EtlError` wrapping the underlying `duckdb::Error` on the first
-/// table that fails.
+/// Runs the one-time cutover global dedup across the given tables (removing
+/// backlog-move strandings). Each entry is `(table_name, is_partitioned)`. Stops
+/// on the first error.
 pub fn run_merge_on_read_global_dedup(
     conn: &duckdb::Connection,
-    tables: &[String],
+    tables: &[(String, bool)],
 ) -> EtlResult<()> {
-    for table in tables {
+    for (table, partitioned) in tables {
         tracing::info!(table = %table, "DuckLake: running global dedup on table");
-        global_dedup_by_id(conn, table)?;
+        global_dedup_table(conn, table, *partitioned)?;
     }
     Ok(())
 }
@@ -199,7 +244,7 @@ pub fn run_merge_on_read_global_dedup(
 mod compaction_tests {
     use duckdb::Connection;
 
-    use super::{compact_partition, global_dedup_by_id, run_merge_on_read_compaction};
+    use super::{compact_table, global_dedup_table, run_merge_on_read_compaction};
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -232,7 +277,7 @@ mod compaction_tests {
         )
         .unwrap();
 
-        compact_partition(&conn, "t").unwrap();
+        compact_table(&conn, "t", false).unwrap();
 
         let id1_credit: i32 = conn
             .query_row("SELECT credit FROM t WHERE id = 1", [], |r| r.get(0))
@@ -265,7 +310,7 @@ mod compaction_tests {
         )
         .unwrap();
 
-        compact_partition(&conn, "t").unwrap();
+        compact_table(&conn, "t", false).unwrap();
 
         let credit: i32 = conn
             .query_row("SELECT credit FROM t WHERE id = 3", [], |r| r.get(0))
@@ -299,7 +344,7 @@ mod compaction_tests {
         )
         .unwrap();
 
-        global_dedup_by_id(&conn, "t").unwrap();
+        global_dedup_table(&conn, "t", false).unwrap();
 
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0))
@@ -312,7 +357,7 @@ mod compaction_tests {
         assert_eq!(month, 7, "the higher-version (month=7) image must survive; stranded month=3 dropped");
 
         // Idempotency: calling again must leave the result unchanged.
-        global_dedup_by_id(&conn, "t").unwrap();
+        global_dedup_table(&conn, "t", false).unwrap();
 
         let total_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0))
@@ -359,7 +404,7 @@ mod compaction_tests {
         )
         .unwrap();
 
-        run_merge_on_read_compaction(&conn, &["t1".to_string(), "t2".to_string()]).unwrap();
+        run_merge_on_read_compaction(&conn, &[("t1".to_string(), false), ("t2".to_string(), false)]).unwrap();
 
         // t1 assertions
         let t1_credit: i32 = conn
@@ -420,7 +465,7 @@ mod compaction_tests {
         )
         .unwrap();
 
-        compact_partition(&conn, "t").unwrap();
+        compact_table(&conn, "t", false).unwrap();
 
         // id=1: pure base row must survive (not dropped by IS NOT TRUE filter).
         let id1_count: i64 = conn
@@ -449,5 +494,146 @@ mod compaction_tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total, 2, "two rows survive: one pure base (id=1) and one real append (id=2)");
+    }
+
+    /// Regression guard for the production crash: an all-tombstone scope collapses
+    /// to zero live rows, so the destructive DELETE is skipped (DuckLake 1.5.3
+    /// FATALs on a collapse-to-empty) and the rows are left untouched.
+    #[test]
+    fn collapse_to_empty_scope_is_skipped() {
+        let conn = open();
+        setup(&conn);
+        conn.execute_batch(
+            "INSERT INTO t VALUES
+               (1, 0, 1, true),
+               (1, 0, 2, true),
+               (2, 0, 1, true);",
+        )
+        .unwrap();
+
+        compact_table(&conn, "t", false).unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "all-tombstone scope: DELETE skipped, rows left in place");
+    }
+
+    /// Already-collapsed scope (one live row per id) is a cheap no-op — the
+    /// steady-state path that makes per-partition compaction incremental.
+    #[test]
+    fn already_collapsed_scope_is_noop() {
+        let conn = open();
+        setup(&conn);
+        conn.execute_batch("INSERT INTO t VALUES (1, 10, 1, false), (2, 20, 1, false);")
+            .unwrap();
+
+        compact_table(&conn, "t", false).unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "already collapsed: unchanged");
+    }
+
+    /// Per-partition collapse keeps the latest version per id within each month
+    /// and drops tombstoned ids.
+    #[test]
+    fn partitioned_compaction_collapses_each_month() {
+        let conn = open();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, credit INTEGER, effective_at_local TIMESTAMP, \
+             _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t VALUES
+               (1, 10, TIMESTAMP '2026-05-10', 1, false),
+               (1, 12, TIMESTAMP '2026-05-10', 2, false),
+               (2, 5,  TIMESTAMP '2026-05-11', 1, false),
+               (2, 0,  TIMESTAMP '2026-05-11', 2, true),
+               (3, 7,  TIMESTAMP '2026-07-01', 1, false),
+               (3, 9,  TIMESTAMP '2026-07-01', 2, false);",
+        )
+        .unwrap();
+
+        compact_table(&conn, "t", true).unwrap();
+
+        let c1: i32 =
+            conn.query_row("SELECT credit FROM t WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(c1, 12, "id=1: May v2 survives");
+        let c2: i64 =
+            conn.query_row("SELECT COUNT(*) FROM t WHERE id = 2", [], |r| r.get(0)).unwrap();
+        assert_eq!(c2, 0, "id=2: tombstoned, dropped");
+        let c3: i32 =
+            conn.query_row("SELECT credit FROM t WHERE id = 3", [], |r| r.get(0)).unwrap();
+        assert_eq!(c3, 9, "id=3: July v2 survives");
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2, "one live row each for id=1 (May) and id=3 (July)");
+    }
+
+    /// Per-month independence: id=1 is live in both May and July (a stranding);
+    /// `compact_table` collapses each month separately so both survive (a
+    /// full-table collapse would leave one). Strandings are `global_dedup_table`'s job.
+    #[test]
+    fn compact_table_collapses_months_independently() {
+        let conn = open();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, credit INTEGER, effective_at_local TIMESTAMP, \
+             _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t VALUES
+               (1, 10, TIMESTAMP '2026-05-10', 1, false),
+               (1, 12, TIMESTAMP '2026-05-10', 2, false),
+               (1, 50, TIMESTAMP '2026-07-01', 3, false),
+               (1, 99, TIMESTAMP '2026-07-01', 4, false);",
+        )
+        .unwrap();
+
+        compact_table(&conn, "t", true).unwrap();
+
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 2, "per-month independence: id=1 keeps one row in each of May and July");
+        let may: i32 = conn
+            .query_row("SELECT credit FROM t WHERE month(effective_at_local) = 5", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(may, 12, "May: v2 wins");
+        let jul: i32 = conn
+            .query_row("SELECT credit FROM t WHERE month(effective_at_local) = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jul, 99, "July: v4 wins");
+    }
+
+    /// Cutover global dedup removes a cross-partition stranding (id=7 in both May
+    /// and July, July wins) while leaving a single-partition id untouched.
+    #[test]
+    fn global_dedup_partitioned_removes_cross_partition_stranding() {
+        let conn = open();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, credit INTEGER, effective_at_local TIMESTAMP, \
+             _etl_version UHUGEINT, _etl_deleted BOOLEAN);",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO t VALUES
+               (7, 1, TIMESTAMP '2026-05-03', 1, false),
+               (7, 2, TIMESTAMP '2026-07-02', 2, false),
+               (8, 3, TIMESTAMP '2026-05-04', 1, false);",
+        )
+        .unwrap();
+
+        global_dedup_table(&conn, "t", true).unwrap();
+
+        let total7: i64 =
+            conn.query_row("SELECT COUNT(*) FROM t WHERE id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(total7, 1, "stranded id=7 deduped to one row");
+        let credit7: i32 =
+            conn.query_row("SELECT credit FROM t WHERE id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(credit7, 2, "higher-version (July) image wins");
+        let total8: i64 =
+            conn.query_row("SELECT COUNT(*) FROM t WHERE id = 8", [], |r| r.get(0)).unwrap();
+        assert_eq!(total8, 1, "single-partition id=8 untouched");
     }
 }
