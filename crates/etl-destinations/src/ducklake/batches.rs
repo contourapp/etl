@@ -72,15 +72,15 @@ use crate::{
 /// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
 /// transaction.
 ///
-/// Mutations apply append-only (no MERGE/delete scan), so this cap now governs
-/// how many wide rows a single partitioned-write `INSERT` buffers. During
-/// backlog drain a batch fans out across many `effective_at_local` partitions
-/// and the writer holds a Parquet row group open per partition, so a smaller cap
-/// keeps peak buffering under the connection's `memory_limit` (the 65,536 cap
-/// OOMed `public_lines` at 4GB). Transaction-lifetime conflicts are not a
-/// concern: maintenance holds the write pause and watermark writes are
-/// append-only.
-const CDC_MUTATION_BATCH_SIZE: usize = 16_384;
+/// Maximum number of ordered CDC mutations grouped into one atomic DuckLake
+/// transaction.
+///
+/// Mutations apply append-only. Peak partitioned-write memory is bounded by the
+/// writer's open-file cap (`partitioned_write_max_open_files`), not by batch
+/// size — so this stays high to minimise per-batch commit and snapshot overhead.
+/// Transaction-lifetime conflicts are not a concern: maintenance holds the write
+/// pause and watermark writes are append-only.
+const CDC_MUTATION_BATCH_SIZE: usize = 65_536;
 /// Value recorded under the prepared-rows-kind metric label; every staging
 /// payload is now an Arrow record batch.
 const PREPARED_ROWS_KIND: &str = "arrow";
@@ -2374,6 +2374,17 @@ impl ReusableStagingTable {
     ) -> EtlResult<()> {
         self.prepare(conn)?;
         self.load_rows(conn, prepared_rows)?;
+
+        // Diagnostic: row count of partitioned merge-on-read appends (the writes
+        // that exercise the partitioned-write open-file cap). In-memory count
+        // only — no extra query, so it cannot poison the open transaction.
+        if self.specs.iter().any(|spec| spec.name == "effective_at_local") {
+            tracing::info!(
+                table = %self.table_name,
+                rows = prepared_rows.row_count(),
+                "ducklake partitioned append insert"
+            );
+        }
 
         let insert_columns = self.insert_column_list();
         let select_exprs = self.select_expr_list();

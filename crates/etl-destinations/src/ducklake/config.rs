@@ -45,13 +45,27 @@ const PRESERVE_INSERTION_ORDER_OPTION_NAME: &str = "preserve_insertion_order";
 /// at the 4GB cap). Apply is S3-I/O-bound, so a low cap costs little throughput.
 const WRITER_THREAD_LIMIT: u8 = 4;
 
+/// Caps how many partition files DuckDB's partitioned writer keeps open at once.
+/// Each open partition buffers a Parquet row group + column dictionaries (~tens
+/// of MB); `public_lines` is partitioned by `(org_id, year, month)` of
+/// `effective_at_local`, so a backlog append spanning many months otherwise
+/// holds a buffer per month-partition simultaneously. At the default (100) that
+/// peak (~100 × ~37 MB) exhausts the 4 GB connection limit — the observed OOM,
+/// which is independent of batch size and thread count. Bounding open files
+/// keeps peak write memory ~constant regardless of how many partitions one
+/// batch touches; superseded fragments are merged by `merge_adjacent_files`.
+const PARTITIONED_WRITE_MAX_OPEN_FILES: u16 = 16;
+
 /// Builds the SQL that configures DuckDB's session-level write tuning: disable
 /// insertion-order preservation (the merge-on-read append log carries no
-/// meaningful physical order) and cap worker threads to bound the
-/// partitioned-writer memory fan-out during large appends.
+/// meaningful physical order), cap worker threads, and bound the
+/// partitioned-writer's simultaneously-open files so a wide append can't exhaust
+/// the connection memory limit.
 fn configure_writer_session_sql() -> String {
     format!(
-        "SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false; SET threads = {WRITER_THREAD_LIMIT};"
+        "SET {PRESERVE_INSERTION_ORDER_OPTION_NAME} = false; \
+         SET threads = {WRITER_THREAD_LIMIT}; \
+         SET partitioned_write_max_open_files = {PARTITIONED_WRITE_MAX_OPEN_FILES};"
     )
 }
 
